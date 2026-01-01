@@ -93,18 +93,102 @@ SQLクエリのパフォーマンス問題を発見し、改善案を提示す�
 ### 4. JOIN
 
 #### チェックポイント
+
 - [ ] **適切なJOIN条件があるか？**
   - ON句で適切に結合されているか
   - カーディナリティの低い列で結合していないか
+  - **結合条件数 >= テーブル数 - 1** を満たすか？
 
-- [ ] **小さいテーブルから結合しているか？**
-  - 結合順序が最適化されているか
-  - 必要に応じてSTRAIGHT_JOINで順序を固定
+- [ ] **駆動表は小さいか？**
+  - FROM句の最初のテーブルが最小行数か
+  - WHERE句で駆動表を絞り込んでいるか
+  - `EXPLAIN` で駆動表の `rows` を確認
+
+- [ ] **内部表の結合キーにインデックスあるか？**
+  - 内部表の結合カラムにインデックスが存在するか
+  - `EXPLAIN` で `Index lookup` が使われているか（`Table scan` でないか）
+  - 複合キーの場合、結合カラムがインデックスの先頭にあるか
+
+- [ ] **内部表のヒット件数が多すぎないか？**
+  - 1行の駆動表に対して内部表が何行返るか
+  - 内部表のWHERE句で絞り込めないか
+  - 必要に応じてサブクエリで事前集約
+
+- [ ] **意図せぬクロス結合が発生してないか？**
+  - 全テーブルに結合条件があるか（孤立したテーブルがないか）
+  - `EXPLAIN` で `rows` が異常に大きくないか
+  - WHERE句結合（カンマ結合）を使っていないか → JOIN句に書き換え
 
 - [ ] **不要なJOINがないか？**
   - 実際に使用していない列のためだけにJOINしていないか
 
-**参照:** [knowledge/join-algorithms.md](../knowledge/join-algorithms.md)
+#### 判断基準
+
+```
+結合が必要？
+├─ NO  → ウィンドウ関数で代替できないか検討
+└─ YES → 次へ
+
+結合条件数 >= テーブル数 - 1？
+├─ NO  → 三角結合のリスク → 結合条件を追加
+└─ YES → 次へ
+
+駆動表の行数 < 内部表の行数？
+├─ NO  → FROM句の順序変更/WHERE句で絞り込み
+└─ YES → 次へ
+
+内部表の結合キーにインデックスあり？
+├─ NO  → インデックス追加を検討
+└─ YES → 次へ
+
+内部表のヒット件数は適切？（駆動表1行あたり < 100行）
+├─ NO  → WHERE句/サブクエリで絞り込み
+└─ YES → OK
+```
+
+#### 悪い例と良い例
+
+```sql
+-- ❌ 悪い例1: 三角結合（結合条件不足）
+SELECT *
+FROM TableA A, TableB B, TableC C
+WHERE A.id = B.id;
+-- C が孤立 → 直積
+
+-- ✅ 良い例1: 全テーブルに結合条件
+SELECT *
+FROM TableA A
+JOIN TableB B ON A.id = B.id
+JOIN TableC C ON B.id = C.id;
+
+-- ❌ 悪い例2: 大きいテーブルが駆動表
+SELECT *
+FROM LargeTable L  -- 100万行
+JOIN SmallTable S  -- 100行
+  ON L.id = S.id;
+
+-- ✅ 良い例2: 小さいテーブルが駆動表
+SELECT *
+FROM SmallTable S  -- 100行
+JOIN LargeTable L  -- 100万行
+  ON S.id = L.id;
+
+-- ❌ 悪い例3: 内部表にインデックスなし
+SELECT *
+FROM SmallTable A
+JOIN LargeTable B ON A.id = B.some_column;
+-- B.some_column にインデックスなし → Table scan
+
+-- ✅ 良い例3: インデックスあり
+CREATE INDEX idx_some_column ON LargeTable(some_column);
+SELECT *
+FROM SmallTable A
+JOIN LargeTable B ON A.id = B.some_column;
+```
+
+**参照:**
+- [knowledge/join-algorithms.md](../knowledge/join-algorithms.md) - 結合アルゴリズムの詳細
+- [knowledge/anti-patterns.md](../knowledge/anti-patterns.md#意図せぬクロス結合三角結合) - 三角結合
 
 ---
 

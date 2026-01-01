@@ -391,3 +391,189 @@ Total time: 120s
 **参照:**
 - [knowledge/window-functions.md](./window-functions.md) - LAG/LEAD/ROW_NUMBERでループ代替
 - [tasks/review-query.md](../tasks/review-query.md) - ぐるぐる系チェックポイント
+
+---
+
+## 意図せぬクロス結合（三角結合）
+
+> 「結合条件を1つでも忘れたら、直積（全行×全行）が発生する」
+
+### 概要
+
+**三角結合（Triangle JOIN）** とは、3つ以上のテーブルを結合する際に、一部のテーブルへの結合条件を忘れ、**意図せずクロス結合**が発生してしまうアンチパターン。
+
+**問題の本質:**
+- 結合条件が不足 → 孤立したテーブルが直積になる
+- データが増えると性能が**指数関数的に悪化**
+- `EXPLAIN` で検出可能だが、見落としやすい
+
+### 問題のパターン
+
+#### パターン1: 結合条件の書き忘れ
+
+```sql
+-- ❌ 悪い例: TableC への結合条件がない
+SELECT *
+FROM TableA A, TableB B, TableC C
+WHERE A.id = B.id;
+-- C が孤立 → (A JOIN B) × C の直積
+```
+
+**何が起きるか:**
+```
+TableA: 100行
+TableB: 100行
+TableC: 1,000行
+
+A JOIN B = 100行（正常）
+(A JOIN B) × C = 100 × 1,000 = 100,000行（異常）
+```
+
+#### パターン2: WHERE句での結合（カンマ結合）
+
+```sql
+-- ❌ 悪い例: WHERE句でのみ結合条件を記述
+SELECT *
+FROM Orders O, Customers C, Products P
+WHERE O.customer_id = C.id
+  AND O.product_id = P.id
+  AND O.order_date >= '2024-01-01';  -- 条件が多いと見落としやすい
+```
+
+**問題:**
+- 結合条件と検索条件が混在 → 可読性低下
+- 条件を1つでも忘れると直積が発生
+
+#### パターン3: サブクエリとの結合忘れ
+
+```sql
+-- ❌ 悪い例: サブクエリへの結合条件がない
+SELECT *
+FROM Orders O,
+     (SELECT * FROM Products WHERE price > 1000) P
+WHERE O.order_date >= '2024-01-01';
+-- P が孤立 → O × P の直積
+```
+
+### 解決策：明示的にJOIN句を使う
+
+#### ✅ 良い例1: JOIN句で結合条件を明示
+
+```sql
+SELECT *
+FROM TableA A
+JOIN TableB B ON A.id = B.id
+JOIN TableC C ON B.id = C.id;  -- 全テーブルに結合条件
+```
+
+#### ✅ 良い例2: 複数カラムでの結合
+
+```sql
+SELECT *
+FROM Orders O
+JOIN Customers C ON O.customer_id = C.id
+JOIN Products P  ON O.product_id = P.id
+WHERE O.order_date >= '2024-01-01';
+```
+
+**メリット:**
+- 結合条件と検索条件が分離 → 可読性向上
+- 結合条件の漏れに気づきやすい
+
+### 検出方法
+
+#### 1. EXPLAIN で rows を確認
+
+```sql
+EXPLAIN FORMAT=TREE
+SELECT *
+FROM TableA A, TableB B, TableC C
+WHERE A.id = B.id;
+```
+
+**出力例:**
+```
+-> Inner hash join  (cost=10000 rows=100000)  ← 異常に大きい
+    -> Table scan on C  (cost=10 rows=1000)
+    -> Hash
+        -> Inner hash join  (cost=20 rows=100)
+            -> Table scan on A
+            -> Hash
+                -> Table scan on B
+```
+
+**判断基準:**
+- `rows` が想定より **10倍以上大きい** → 直積の疑い
+- `cost` が異常に高い
+
+#### 2. 実行時間で検出
+
+```sql
+-- テスト実行（LIMIT で被害を最小化）
+SELECT *
+FROM TableA A, TableB B, TableC C
+WHERE A.id = B.id
+LIMIT 10;
+```
+
+**判断基準:**
+- 単純な結合なのに **1秒以上かかる** → 直積の疑い
+
+#### 3. 結合条件数をチェック
+
+```
+結合条件数 = テーブル数 - 1
+```
+
+**例:**
+- 3テーブル結合 → 最低2つの結合条件が必要
+- 4テーブル結合 → 最低3つの結合条件が必要
+
+```sql
+-- ❌ 悪い例: 3テーブルなのに結合条件が1つ
+FROM A, B, C WHERE A.id = B.id
+
+-- ✅ 良い例: 3テーブルで結合条件が2つ
+FROM A JOIN B ON A.id = B.id
+       JOIN C ON B.id = C.id
+```
+
+### 判断フロー
+
+```
+テーブル数は3つ以上？
+├─ NO  → 三角結合のリスクなし
+└─ YES → 次へ
+
+結合条件数 >= テーブル数 - 1？
+├─ YES → OK
+└─ NO  → 結合条件が不足（直積のリスク）
+
+JOIN句を使っているか？
+├─ YES → 可読性OK
+└─ NO  → WHERE句結合 → JOIN句に書き換え推奨
+
+EXPLAIN で rows が適切か？
+├─ YES → OK
+└─ NO  → 直積が発生している → 結合条件を追加
+```
+
+### まとめ
+
+**やってはいけないこと:**
+❌ WHERE句でのみ結合条件を記述（カンマ結合）
+❌ 結合条件数 < テーブル数 - 1
+
+**やるべきこと:**
+✅ JOIN句で明示的に結合条件を記述
+✅ `結合条件数 = テーブル数 - 1` を満たす
+✅ EXPLAIN で rows を確認
+
+**検出方法:**
+1. EXPLAIN で `rows` が異常に大きい
+2. 実行時間が予想外に長い
+3. 結合条件数 < テーブル数 - 1
+
+**参照:**
+- [knowledge/join-algorithms.md](./join-algorithms.md#結合が遅い時のチェックリスト) - 意図せぬクロス結合の詳細
+- [tasks/review-query.md](../tasks/review-query.md#4-join) - 結合チェックリスト
