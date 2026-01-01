@@ -574,3 +574,324 @@ FOR文でループ       →  LAG/LEAD（前後の行参照）
 
 **参照:**
 - [knowledge/anti-patterns.md](./anti-patterns.md#ぐるぐる系n1問題) - N+1問題の詳細
+
+---
+
+## サブクエリからウィンドウ関数への置き換え
+
+> 「困難は分割するな。ウィンドウ関数で結合を消去せよ」
+
+### 概要
+
+サブクエリを使うと、**同じテーブルに複数回アクセス**し、結合が発生してI/Oが増加する。ウィンドウ関数を使えば、テーブルアクセスを1回に減らせる。
+
+---
+
+### パターン1: MIN/MAX取得 → ROW_NUMBER
+
+#### ❌ サブクエリ結合（遅い）
+
+```sql
+-- Receiptsテーブルに2回アクセス
+SELECT R1.cust_id, R1.seq, R1.price
+FROM Receipts R1
+INNER JOIN (
+    SELECT cust_id, MIN(seq) AS min_seq
+    FROM Receipts  -- ← 1回目のアクセス
+    GROUP BY cust_id
+) R2
+ON R1.cust_id = R2.cust_id  -- ← 2回目のアクセス（R1として）
+AND R1.seq = R2.min_seq;
+```
+
+**問題:**
+- テーブルアクセス2回
+- 結合1回
+- 実行計画変動リスク
+
+**EXPLAIN例:**
+```
+-> Inner hash join  (cost=500 rows=100)
+    -> Table scan on R1  (cost=200 rows=10000)  ← 1回目
+    -> Hash
+        -> Table scan on Receipts  (cost=200 rows=10000)  ← 2回目
+```
+
+#### ✅ ROW_NUMBER（速い）
+
+```sql
+-- Receiptsテーブルに1回だけアクセス
+SELECT cust_id, seq, price
+FROM (
+    SELECT cust_id, seq, price,
+           ROW_NUMBER() OVER (
+               PARTITION BY cust_id
+               ORDER BY seq
+           ) AS row_seq
+    FROM Receipts  -- ← 1回のアクセス
+) WORK
+WHERE WORK.row_seq = 1;
+```
+
+**改善点:**
+- テーブルアクセス1回のみ
+- 結合なし
+- I/O削減
+
+**EXPLAIN例:**
+```
+-> Filter: (WORK.row_seq = 1)
+    -> Window aggregate
+        -> Table scan on Receipts  (cost=200 rows=10000)  ← 1回のみ
+```
+
+**性能比較:**
+```
+サブクエリ結合: 約2倍遅い（テーブルアクセス2回）
+ROW_NUMBER:    高速（テーブルアクセス1回）
+```
+
+---
+
+### パターン2: 相関サブクエリ → ウィンドウ関数
+
+#### ❌ 相関サブクエリ（遅い）
+
+```sql
+-- 外側の行ごとに内側のSQLを実行
+SELECT cust_id, seq, price
+FROM Receipts R1
+WHERE seq = (
+    SELECT MIN(seq)
+    FROM Receipts R2
+    WHERE R1.cust_id = R2.cust_id  -- 相関条件
+);
+```
+
+**問題:**
+- やっぱりテーブルに2回アクセス
+- 外側の行ごとにループ
+- 実行計画は結合とほぼ同じ
+
+**EXPLAIN例:**
+```
+-> Filter: (R1.seq = (select #2))
+    -> Table scan on R1  (cost=200 rows=10000)  ← 1回目
+    -> Select #2  ← 外側の行ごとに実行
+        -> Aggregate
+            -> Table scan on R2  (cost=200 rows=10000)  ← 2回目
+```
+
+#### ✅ ウィンドウ関数（速い）
+
+```sql
+-- 同じ結果を1回のスキャンで取得
+SELECT cust_id, seq, price
+FROM (
+    SELECT cust_id, seq, price,
+           ROW_NUMBER() OVER (
+               PARTITION BY cust_id
+               ORDER BY seq
+           ) AS row_seq
+    FROM Receipts
+) WORK
+WHERE WORK.row_seq = 1;
+```
+
+**改善点:**
+- 相関条件が不要
+- ループなし
+- テーブルアクセス1回
+
+---
+
+### パターン3: 集約結果の取得 → MAX/MIN OVER
+
+#### ❌ サブクエリで集約（遅い）
+
+```sql
+-- 顧客ごとの最大購入額を全行に付与
+SELECT R1.cust_id, R1.seq, R1.price,
+       (SELECT MAX(price)
+        FROM Receipts R2
+        WHERE R2.cust_id = R1.cust_id) AS max_price
+FROM Receipts R1;
+```
+
+**問題:**
+- 外側の行ごとにサブクエリ実行
+- テーブルに2回アクセス
+
+#### ✅ MAX OVER（速い）
+
+```sql
+-- ウィンドウ関数で1回のスキャンで取得
+SELECT cust_id, seq, price,
+       MAX(price) OVER (PARTITION BY cust_id) AS max_price
+FROM Receipts;
+```
+
+**改善点:**
+- サブクエリ不要
+- テーブルアクセス1回
+- 全行に集約結果を付与
+
+**結果:**
+| cust_id | seq | price | max_price |
+|---------|-----|-------|-----------|
+| A | 1 | 100 | 300 |
+| A | 2 | 300 | 300 |
+| A | 3 | 200 | 300 |
+| B | 1 | 150 | 250 |
+| B | 2 | 250 | 250 |
+
+---
+
+### パターン4: 前後の値との比較 → LAG/LEAD
+
+#### ❌ 自己結合（遅い）
+
+```sql
+-- 前年の売上と比較
+SELECT S1.company, S1.year, S1.sale,
+       S2.sale AS prev_sale,
+       S1.sale - S2.sale AS diff
+FROM Sales S1
+LEFT JOIN Sales S2
+  ON S1.company = S2.company
+  AND S1.year = S2.year + 1;
+```
+
+**問題:**
+- テーブルに2回アクセス
+- 結合が発生
+
+#### ✅ LAG（速い）
+
+```sql
+-- ウィンドウ関数で前年の値を参照
+SELECT company, year, sale,
+       LAG(sale) OVER (PARTITION BY company ORDER BY year) AS prev_sale,
+       sale - LAG(sale) OVER (PARTITION BY company ORDER BY year) AS diff
+FROM Sales;
+```
+
+**改善点:**
+- 自己結合不要
+- テーブルアクセス1回
+- 前年がない場合はNULL（自然な動作）
+
+---
+
+### パターン5: グループ内の順位 → RANK/DENSE_RANK
+
+#### ❌ サブクエリでカウント（遅い）
+
+```sql
+-- 各年の売上ランキング
+SELECT company, year, sale,
+       (SELECT COUNT(*) + 1
+        FROM Sales S2
+        WHERE S2.year = S1.year
+          AND S2.sale > S1.sale) AS rank
+FROM Sales S1;
+```
+
+**問題:**
+- 外側の行ごとにサブクエリ実行
+- テーブルに2回アクセス
+
+#### ✅ RANK（速い）
+
+```sql
+-- ウィンドウ関数で順位付け
+SELECT company, year, sale,
+       RANK() OVER (PARTITION BY year ORDER BY sale DESC) AS rank
+FROM Sales;
+```
+
+**改善点:**
+- サブクエリ不要
+- テーブルアクセス1回
+- 同順位の処理が自動
+
+**結果:**
+| company | year | sale | rank |
+|---------|------|------|------|
+| B社 | 2020 | 200 | 1 |
+| A社 | 2020 | 100 | 2 |
+| B社 | 2021 | 250 | 1 |
+| A社 | 2021 | 150 | 2 |
+
+---
+
+## サブクエリ vs ウィンドウ関数 比較表
+
+| 処理内容 | サブクエリ | ウィンドウ関数 | テーブルアクセス削減 |
+|---------|-----------|---------------|-------------------|
+| **MIN/MAX取得** | サブクエリ結合 | ROW_NUMBER | 2回 → 1回 |
+| **相関サブクエリ** | WHERE句でループ | ROW_NUMBER | 2回 → 1回 |
+| **集約結果付与** | スカラーサブクエリ | MAX/MIN OVER | 2回 → 1回 |
+| **前後の値参照** | 自己結合 | LAG/LEAD | 2回 → 1回 |
+| **順位付け** | COUNTサブクエリ | RANK | 2回 → 1回 |
+
+---
+
+## 置き換えの判断フロー
+
+```
+サブクエリを使っている？
+├─ NO  → OK
+└─ YES → 次へ
+
+同じテーブルに複数回アクセス？
+├─ NO  → 次へ（別テーブルとの結合なら問題なし）
+└─ YES → ウィンドウ関数で置き換え検討
+
+置き換え可能なパターン？
+├─ MIN/MAX取得          → ROW_NUMBER
+├─ 相関サブクエリ        → ROW_NUMBER
+├─ 集約結果の全行付与    → MAX/MIN/AVG OVER
+├─ 前後の値との比較      → LAG/LEAD
+└─ グループ内順位        → RANK/DENSE_RANK
+
+結合前に行数を大幅に絞れる？（10倍以上）
+├─ YES → サブクエリ有効（そのまま）
+└─ NO  → ウィンドウ関数で置き換え
+```
+
+---
+
+## まとめ
+
+### サブクエリの問題点
+
+❌ 同じテーブルに複数回アクセス → **I/O増加**
+❌ 結合が発生 → 実行計画変動リスク
+❌ 相関サブクエリ → ループ処理
+
+### ウィンドウ関数の利点
+
+✅ テーブルアクセス1回のみ
+✅ 結合不要
+✅ I/O最小化
+✅ 実行計画が安定
+
+### 置き換えパターン
+
+| サブクエリパターン | ウィンドウ関数 |
+|------------------|--------------|
+| MIN/MAX取得 | ROW_NUMBER |
+| 相関サブクエリ | ROW_NUMBER |
+| 集約結果付与 | MAX/MIN/AVG OVER |
+| 前後の値参照 | LAG/LEAD |
+| 順位付け | RANK/DENSE_RANK |
+
+### 例外（サブクエリが有効）
+
+✅ 結合前に行数を大幅に絞れる場合（10倍以上削減）
+
+**参照:**
+- [knowledge/subquery-problems.md](./subquery-problems.md) - サブクエリの問題点
+- [knowledge/anti-patterns.md](./anti-patterns.md#サブクエリパラノイア) - サブクエリ・パラノイア
+- [tasks/review-query.md](../tasks/review-query.md#5-サブクエリ) - サブクエリチェックリスト

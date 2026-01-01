@@ -577,3 +577,234 @@ EXPLAIN で rows が適切か？
 **参照:**
 - [knowledge/join-algorithms.md](./join-algorithms.md#結合が遅い時のチェックリスト) - 意図せぬクロス結合の詳細
 - [tasks/review-query.md](../tasks/review-query.md#4-join) - 結合チェックリスト
+
+---
+
+## サブクエリ・パラノイア
+
+> 「SQLパフォーマンスの要諦: 1にI/O、2にI/O、3、4がなくて5にI/O」
+
+### 概要
+
+**サブクエリ・パラノイア（Subquery Paranoia）** とは、サブクエリを使うことでテーブルへの複数回アクセスや不要な結合が発生し、性能が劣化するアンチパターン。
+
+**問題の本質:**
+- 同じテーブルに複数回アクセス → **I/O増加**
+- サブクエリとの結合が発生 → 実行計画変動リスク
+- 一時領域の使用 → TEMP落ちリスク
+- インデックスが効かない → 最適化されない
+
+### 問題のパターン
+
+#### パターン1: サブクエリで集約 → 結合
+
+```sql
+-- ❌ 悪い例: 最小値をサブクエリで取得して結合
+SELECT R1.cust_id, R1.seq, R1.price
+FROM Receipts R1
+INNER JOIN (
+    SELECT cust_id, MIN(seq) AS min_seq
+    FROM Receipts  -- ← Receiptsに2回アクセス
+    GROUP BY cust_id
+) R2
+ON R1.cust_id = R2.cust_id
+AND R1.seq = R2.min_seq;
+```
+
+**何が起きるか:**
+```
+1. Receiptsテーブルをスキャン（サブクエリ）
+2. MIN値を計算して一時テーブル作成
+3. Receiptsテーブルを再度スキャン（R1として）
+4. 一時テーブルと結合
+
+→ テーブルアクセス2回、結合1回
+```
+
+**EXPLAIN例:**
+```
+-> Inner hash join  (cost=500 rows=100)
+    -> Table scan on R1  (cost=200 rows=10000)  ← 1回目
+    -> Hash
+        -> Table scan on Receipts  (cost=200 rows=10000)  ← 2回目
+            -> Aggregate using temp table
+```
+
+#### パターン2: 相関サブクエリ
+
+```sql
+-- ❌ 悪い例: 相関サブクエリ
+SELECT cust_id, seq, price
+FROM Receipts R1
+WHERE seq = (
+    SELECT MIN(seq)
+    FROM Receipts R2
+    WHERE R1.cust_id = R2.cust_id  -- 相関条件
+);
+```
+
+**何が起きるか:**
+- 外側の行ごとに内側のSQLを実行（ループ）
+- やっぱりテーブルに2回アクセス
+- 実行計画は結合とほぼ同じ
+
+**EXPLAIN例:**
+```
+-> Filter: (R1.seq = (select #2))
+    -> Table scan on R1  (cost=200 rows=10000)  ← 1回目
+    -> Select #2
+        -> Aggregate
+            -> Filter: (R1.cust_id = R2.cust_id)
+                -> Table scan on R2  (cost=200 rows=10000)  ← 2回目
+```
+
+### 解決策：ウィンドウ関数で結合をなくす
+
+#### ✅ 良い例: ROW_NUMBER で置き換え
+
+```sql
+SELECT cust_id, seq, price
+FROM (
+    SELECT cust_id, seq, price,
+           ROW_NUMBER() OVER (
+               PARTITION BY cust_id
+               ORDER BY seq
+           ) AS row_seq
+    FROM Receipts
+) WORK
+WHERE WORK.row_seq = 1;
+```
+
+**改善点:**
+- ✅ テーブルアクセス**1回だけ**
+- ✅ 結合なし
+- ✅ 実行計画がシンプルで安定
+- ✅ **I/Oが最小化**
+
+**EXPLAIN例:**
+```
+-> Filter: (WORK.row_seq = 1)
+    -> Window aggregate
+        -> Table scan on Receipts  (cost=200 rows=10000)  ← 1回のみ
+```
+
+**性能差:**
+```
+サブクエリ結合:   テーブルアクセス2回 → 約2倍遅い
+ウィンドウ関数:   テーブルアクセス1回 → 高速
+```
+
+### サブクエリが許容されるケース
+
+#### 例外: 結合前に行数を大幅に絞れる場合
+
+```sql
+-- ❌ 解1: 結合してから集約（遅い可能性）
+SELECT C.co_cd, MAX(S.emp_count)
+FROM Companies C
+INNER JOIN Shops S ON C.co_cd = S.co_cd
+WHERE main_flg = 'Y'
+GROUP BY C.co_cd;
+-- 結合: 500万行 × 100行 → その後絞り込み
+
+-- ✅ 解2: 先に集約してから結合（速い可能性）
+SELECT C.co_cd, CSUM.total_emp
+FROM Companies C
+INNER JOIN (
+    SELECT co_cd, SUM(emp_count) AS total_emp
+    FROM Shops
+    WHERE main_flg = 'Y'  -- 先に絞り込み
+    GROUP BY co_cd
+) CSUM
+ON C.co_cd = CSUM.co_cd;
+-- 結合: 1,000行 × 100行
+```
+
+**解2が速い理由:**
+- 結合対象が 500万行 → 1,000行 に減る
+- 結合コストが大幅に下がる
+- **I/Oが削減される**
+
+**判断基準:**
+```
+サブクエリで絞り込める行数が多いか？
+├─ YES（10倍以上削減） → サブクエリ有効
+└─ NO（削減効果小）   → ウィンドウ関数で結合回避
+```
+
+### 検出方法
+
+#### 1. EXPLAINでテーブルアクセス回数を確認
+
+```sql
+EXPLAIN FORMAT=TREE
+SELECT R1.cust_id, R1.seq, R1.price
+FROM Receipts R1
+INNER JOIN (
+    SELECT cust_id, MIN(seq) AS min_seq
+    FROM Receipts
+    GROUP BY cust_id
+) R2
+ON R1.cust_id = R2.cust_id
+AND R1.seq = R2.min_seq;
+```
+
+**確認ポイント:**
+- 同じテーブル名が**2回以上**出現 → サブクエリ・パラノイア
+
+#### 2. クエリ構造をチェック
+
+```
+FROM句にサブクエリがある？
+├─ NO  → OK
+└─ YES → 次へ
+
+サブクエリ内のテーブルとFROM句のテーブルが同じ？
+├─ NO  → OK（別テーブルの結合）
+└─ YES → サブクエリ・パラノイア
+```
+
+### 判断フロー
+
+```
+サブクエリを使っている？
+├─ NO  → OK
+└─ YES → 次へ
+
+同じテーブルに複数回アクセスしている？
+├─ NO  → 次へ
+└─ YES → ウィンドウ関数で置き換え検討
+
+サブクエリで結合が発生している？
+├─ NO  → 次へ
+└─ YES → ウィンドウ関数で置き換え検討
+
+結合前に行数を大幅に絞れる？（10倍以上）
+├─ YES → サブクエリ有効（そのまま）
+└─ NO  → ウィンドウ関数で置き換え
+```
+
+### まとめ
+
+**やってはいけないこと:**
+❌ 同じテーブルに複数回アクセス
+❌ サブクエリとの不要な結合
+❌ 思考の補助として書いたサブクエリをそのまま実行
+
+**やるべきこと:**
+✅ ウィンドウ関数で結合を消去
+✅ テーブルアクセスを1回に
+✅ I/Oを最小化
+
+**例外（サブクエリが有効）:**
+✅ 結合前に行数を大幅に絞れる場合（10倍以上）
+
+**心構え:**
+- 「困難は分割するな」
+- 思考の補助としてサブクエリを使うのはOK
+- 最終的には統合してシンプルにする
+
+**参照:**
+- [knowledge/subquery-problems.md](./subquery-problems.md) - サブクエリの問題点の詳細
+- [knowledge/window-functions.md](./window-functions.md#サブクエリからウィンドウ関数への置き換え) - ウィンドウ関数への置き換えパターン
+- [tasks/review-query.md](../tasks/review-query.md#5-サブクエリ) - サブクエリチェックリスト

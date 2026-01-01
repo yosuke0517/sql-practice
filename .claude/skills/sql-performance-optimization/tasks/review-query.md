@@ -195,24 +195,121 @@ JOIN LargeTable B ON A.id = B.some_column;
 ### 5. サブクエリ
 
 #### チェックポイント
-- [ ] **相関サブクエリを使っていないか？**
-  ```sql
-  -- ❌ 相関サブクエリ（遅い）
-  SELECT name
-  FROM users u
-  WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);
 
-  -- ✅ JOIN（速い）
-  SELECT DISTINCT u.name
-  FROM users u
-  INNER JOIN orders o ON o.user_id = u.id;
-  ```
+- [ ] **同じテーブルに複数回アクセスしていないか？**
+  - サブクエリ内のテーブルとFROM句のテーブルが同じではないか
+  - `EXPLAIN` で同じテーブル名が2回以上出現していないか
+  - テーブルアクセス回数が多い → **I/O増加**
+
+- [ ] **サブクエリで結合が発生していないか？**
+  - FROM句のサブクエリでJOINが発生していないか
+  - 結合 → 実行計画変動リスク
+  - ウィンドウ関数で置き換え可能か検討
+
+- [ ] **ウィンドウ関数で置き換え可能か？**
+  - MIN/MAX取得 → `ROW_NUMBER` で置き換え
+  - 相関サブクエリ → `ROW_NUMBER` で置き換え
+  - 集約結果の全行付与 → `MAX/MIN/AVG OVER` で置き換え
+  - 前後の値参照 → `LAG/LEAD` で置き換え
+  - 順位付け → `RANK/DENSE_RANK` で置き換え
+
+- [ ] **相関サブクエリを使っていないか？**
+  - WHERE句やSELECT句で外側の行を参照するサブクエリ
+  - 外側の行ごとにループ実行される → 遅い
+  - ウィンドウ関数またはJOINで代替
+
+- [ ] **結合前に行数を絞れているか？**（サブクエリが有効なケース）
+  - サブクエリで10倍以上削減できる場合は有効
+  - 先に集約/絞り込み → 結合コスト削減
 
 - [ ] **INサブクエリが大きすぎないか？**
   - IN句の中に大量のデータを含むサブクエリがないか
   - JOINやEXISTSで代替できないか
 
-**参照:** [knowledge/subquery-problems.md](../knowledge/subquery-problems.md)
+#### 判断基準
+
+```
+サブクエリを使っている？
+├─ NO  → OK
+└─ YES → 次へ
+
+同じテーブルに複数回アクセス？
+├─ NO  → 次へ
+└─ YES → ウィンドウ関数で置き換え検討
+
+サブクエリで結合が発生？
+├─ NO  → 次へ
+└─ YES → ウィンドウ関数で置き換え検討
+
+結合前に行数を大幅に絞れる？（10倍以上）
+├─ YES → サブクエリ有効（そのまま）
+└─ NO  → ウィンドウ関数で置き換え
+```
+
+#### 悪い例と良い例
+
+```sql
+-- ❌ 悪い例1: サブクエリで集約 → 結合
+SELECT R1.cust_id, R1.seq, R1.price
+FROM Receipts R1
+INNER JOIN (
+    SELECT cust_id, MIN(seq) AS min_seq
+    FROM Receipts  -- ← Receiptsに2回アクセス
+    GROUP BY cust_id
+) R2
+ON R1.cust_id = R2.cust_id
+AND R1.seq = R2.min_seq;
+
+-- ✅ 良い例1: ROW_NUMBERで置き換え
+SELECT cust_id, seq, price
+FROM (
+    SELECT cust_id, seq, price,
+           ROW_NUMBER() OVER (
+               PARTITION BY cust_id
+               ORDER BY seq
+           ) AS row_seq
+    FROM Receipts  -- ← 1回のアクセス
+) WORK
+WHERE WORK.row_seq = 1;
+
+-- ❌ 悪い例2: 相関サブクエリ
+SELECT cust_id, seq, price
+FROM Receipts R1
+WHERE seq = (
+    SELECT MIN(seq)
+    FROM Receipts R2
+    WHERE R1.cust_id = R2.cust_id  -- 相関条件
+);
+
+-- ✅ 良い例2: ウィンドウ関数
+SELECT cust_id, seq, price
+FROM (
+    SELECT cust_id, seq, price,
+           ROW_NUMBER() OVER (
+               PARTITION BY cust_id
+               ORDER BY seq
+           ) AS row_seq
+    FROM Receipts
+) WORK
+WHERE WORK.row_seq = 1;
+
+-- ✅ 良い例3: サブクエリが有効なケース（結合前に絞り込み）
+-- 500万行 → 1,000行に削減してから結合
+SELECT C.co_cd, CSUM.total_emp
+FROM Companies C
+INNER JOIN (
+    SELECT co_cd, SUM(emp_count) AS total_emp
+    FROM Shops
+    WHERE main_flg = 'Y'  -- 先に絞り込み
+    GROUP BY co_cd
+) CSUM
+ON C.co_cd = CSUM.co_cd;
+```
+
+**参照:**
+- [knowledge/subquery-problems.md](../knowledge/subquery-problems.md) - サブクエリの問題点
+- [knowledge/anti-patterns.md](../knowledge/anti-patterns.md#サブクエリパラノイア) - サブクエリ・パラノイア
+- [knowledge/window-functions.md](../knowledge/window-functions.md#サブクエリからウィンドウ関数への置き換え) - ウィンドウ関数への置き換えパターン
 
 ---
 
