@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: mysql-learning
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: sql_practice
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql/conf.d:/etc/mysql/conf.d
+      - ./mysql/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  java-app:
+    build: ./java-app
+    container_name: java-learning
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: sql_practice
+      DB_USER: root
+      DB_PASSWORD: root
+    volumes:
+      - ./java-app:/app
+    working_dir: /app
+    command: gradle run
+
+volumes:
+  mysql-data:
