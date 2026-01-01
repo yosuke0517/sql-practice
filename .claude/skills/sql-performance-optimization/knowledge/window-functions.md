@@ -253,3 +253,324 @@ GROUP BY
 | **PARTITION BY** | カットのみ（行を保つ） |
 
 **重要:** GROUP BY句には列名だけでなく、CASE式や計算式も使える！
+
+---
+
+## ウィンドウ関数でループを代替
+
+### ループが必要な理由
+手続き型プログラミングでは「前の行」「次の行」を参照するためにループを使う
+
+```java
+// Javaでの典型的なループ
+for (int i = 0; i < sales.length; i++) {
+    if (i > 0) {
+        diff = sales[i] - sales[i-1];  // 前の行を参照
+    }
+}
+```
+
+SQLでは **ウィンドウ関数** がこれを代替する！
+
+---
+
+## LAG/LEAD: 前後の行を参照
+
+### LAG関数（前の行を参照）
+
+#### 基本構文
+```sql
+LAG(列名, オフセット, デフォルト値) OVER (
+    PARTITION BY パーティション列
+    ORDER BY ソート列
+)
+```
+
+**パラメータ:**
+- `列名`: 参照したい列
+- `オフセット`: 何行前を見るか（省略時は1）
+- `デフォルト値`: 前の行がない場合の値（省略時はNULL）
+
+#### 例1: 前年比を計算
+```sql
+-- ❌ ぐるぐる系
+for (company : companies) {
+    prevYear = SELECT sale FROM Sales WHERE company = ? AND year = ? - 1;
+    thisYear = SELECT sale FROM Sales WHERE company = ? AND year = ?;
+    diff = thisYear - prevYear;
+}
+
+-- ✅ ガツン系（LAG関数）
+SELECT company, year, sale,
+       sale - LAG(sale) OVER (PARTITION BY company ORDER BY year) AS diff,
+       CASE SIGN(sale - LAG(sale) OVER (PARTITION BY company ORDER BY year))
+            WHEN 1  THEN '増加'
+            WHEN -1 THEN '減少'
+            WHEN 0  THEN '横ばい'
+       END AS trend
+FROM Sales;
+```
+
+**結果:**
+| company | year | sale | diff | trend |
+|---------|------|------|------|-------|
+| A社 | 2020 | 100 | NULL | NULL |
+| A社 | 2021 | 150 | 50 | 増加 |
+| A社 | 2022 | 120 | -30 | 減少 |
+| B社 | 2020 | 200 | NULL | NULL |
+| B社 | 2021 | 250 | 50 | 増加 |
+
+**ポイント:**
+- `PARTITION BY company`: 会社ごとに分割
+- `ORDER BY year`: 年でソート
+- 各パーティションの最初の行はNULL
+
+#### 例2: 2行前を参照
+```sql
+SELECT date, price,
+       LAG(price, 1) OVER (ORDER BY date) AS prev_1day,
+       LAG(price, 2) OVER (ORDER BY date) AS prev_2day,
+       price - LAG(price, 2) OVER (ORDER BY date) AS diff_2day
+FROM StockPrices;
+```
+
+### LEAD関数（次の行を参照）
+
+#### 基本構文
+```sql
+LEAD(列名, オフセット, デフォルト値) OVER (
+    PARTITION BY パーティション列
+    ORDER BY ソート列
+)
+```
+
+#### 例: 次の値との差分
+```sql
+SELECT date, temperature,
+       LEAD(temperature) OVER (ORDER BY date) AS next_temp,
+       LEAD(temperature) OVER (ORDER BY date) - temperature AS temp_change
+FROM Weather;
+```
+
+**結果:**
+| date | temperature | next_temp | temp_change |
+|------|-------------|-----------|-------------|
+| 2024-01-01 | 10 | 12 | 2 |
+| 2024-01-02 | 12 | 8 | -4 |
+| 2024-01-03 | 8 | NULL | NULL |
+
+---
+
+## ROW_NUMBER: 行番号を付与
+
+### 基本構文
+```sql
+ROW_NUMBER() OVER (
+    PARTITION BY パーティション列
+    ORDER BY ソート列
+)
+```
+
+#### 例1: 各グループ内での連番
+```sql
+SELECT company, year, sale,
+       ROW_NUMBER() OVER (PARTITION BY company ORDER BY year) AS row_num
+FROM Sales;
+```
+
+**結果:**
+| company | year | sale | row_num |
+|---------|------|------|---------|
+| A社 | 2020 | 100 | 1 |
+| A社 | 2021 | 150 | 2 |
+| A社 | 2022 | 120 | 3 |
+| B社 | 2020 | 200 | 1 |
+| B社 | 2021 | 250 | 2 |
+
+#### 例2: 最初と最後の行を特定
+```sql
+WITH numbered AS (
+    SELECT company, year, sale,
+           ROW_NUMBER() OVER (PARTITION BY company ORDER BY year) AS row_num,
+           COUNT(*) OVER (PARTITION BY company) AS total_rows
+    FROM Sales
+)
+SELECT company, year, sale,
+       CASE
+           WHEN row_num = 1 THEN '初年度'
+           WHEN row_num = total_rows THEN '最終年度'
+           ELSE '中間'
+       END AS period_type
+FROM numbered;
+```
+
+---
+
+## 実践例: ぐるぐる系をガツン系に変換
+
+### 例1: 累積売上の計算
+
+#### ❌ ぐるぐる系
+```java
+cumulative = 0;
+for (sale : sales) {
+    cumulative += sale.amount;
+    sale.cumulative = cumulative;
+    updateDatabase(sale);
+}
+```
+
+#### ✅ ガツン系（SUM OVER）
+```sql
+SELECT date, amount,
+       SUM(amount) OVER (ORDER BY date) AS cumulative_amount
+FROM Sales;
+```
+
+**結果:**
+| date | amount | cumulative_amount |
+|------|--------|-------------------|
+| 2024-01-01 | 100 | 100 |
+| 2024-01-02 | 200 | 300 |
+| 2024-01-03 | 150 | 450 |
+
+---
+
+### 例2: ランキングと順位変動
+
+#### ❌ ぐるぐる系
+```java
+// 今月と前月のランキングを取得
+thisMonthRank = getRanking(thisMonth);
+lastMonthRank = getRanking(lastMonth);
+
+for (product : products) {
+    thisRank = thisMonthRank.get(product.id);
+    lastRank = lastMonthRank.get(product.id);
+    rankChange = lastRank - thisRank;
+}
+```
+
+#### ✅ ガツン系（RANK + LAG）
+```sql
+WITH monthly_ranks AS (
+    SELECT product_id, month,
+           RANK() OVER (PARTITION BY month ORDER BY sales DESC) AS rank
+    FROM Sales
+)
+SELECT product_id, month, rank,
+       LAG(rank) OVER (PARTITION BY product_id ORDER BY month) AS prev_rank,
+       LAG(rank) OVER (PARTITION BY product_id ORDER BY month) - rank AS rank_change
+FROM monthly_ranks;
+```
+
+---
+
+### 例3: 欠損値の補完
+
+#### ❌ ぐるぐる系
+```java
+lastValue = null;
+for (row : data) {
+    if (row.value != null) {
+        lastValue = row.value;
+    } else {
+        row.value = lastValue;  // 前の値で補完
+    }
+}
+```
+
+#### ✅ ガツン系（COALESCE + LAG + 再帰）
+```sql
+-- MySQL 8.0+
+WITH RECURSIVE filled AS (
+    SELECT date, value,
+           ROW_NUMBER() OVER (ORDER BY date) AS rn
+    FROM Sensor
+),
+forward_fill AS (
+    -- 最初の行
+    SELECT date, value, rn, value AS filled_value
+    FROM filled
+    WHERE rn = 1
+
+    UNION ALL
+
+    -- 再帰
+    SELECT f.date, f.value, f.rn,
+           COALESCE(f.value, ff.filled_value) AS filled_value
+    FROM filled f
+    JOIN forward_fill ff ON f.rn = ff.rn + 1
+)
+SELECT date, value, filled_value
+FROM forward_fill
+ORDER BY date;
+```
+
+**シンプルな代替（最後の非NULL値で補完）:**
+```sql
+SELECT date, value,
+       COALESCE(value,
+           LAG(value) OVER (ORDER BY date),
+           LAG(value, 2) OVER (ORDER BY date),
+           -- ... 必要に応じて
+           0  -- デフォルト値
+       ) AS filled_value
+FROM Sensor;
+```
+
+---
+
+## ウィンドウ関数の組み合わせ
+
+### CASE式 + ウィンドウ関数
+```sql
+-- 売上が前年比で増加した月だけ集計
+SELECT company,
+       SUM(CASE WHEN sale > LAG(sale) OVER (PARTITION BY company ORDER BY year)
+                THEN sale
+                ELSE 0
+           END) AS total_increased_sales
+FROM Sales
+GROUP BY company;
+```
+
+### 複数のウィンドウ関数
+```sql
+SELECT company, year, sale,
+       LAG(sale) OVER (PARTITION BY company ORDER BY year) AS prev_sale,
+       LEAD(sale) OVER (PARTITION BY company ORDER BY year) AS next_sale,
+       RANK() OVER (PARTITION BY year ORDER BY sale DESC) AS rank_in_year,
+       AVG(sale) OVER (PARTITION BY company) AS avg_sale_company
+FROM Sales;
+```
+
+---
+
+## パフォーマンス比較
+
+| 処理内容 | ぐるぐる系 | ガツン系 | 改善率 |
+|---------|-----------|---------|--------|
+| 前年比計算（1万件） | 10秒 | 0.1秒 | 100倍 |
+| 累積売上（1万件） | 15秒 | 0.2秒 | 75倍 |
+| ランキング（1万件） | 12秒 | 0.3秒 | 40倍 |
+
+---
+
+## まとめ
+
+**ウィンドウ関数でループを代替:**
+```
+FOR文でループ       →  LAG/LEAD（前後の行参照）
+累積計算            →  SUM OVER（累積和）
+連番付与            →  ROW_NUMBER（行番号）
+ランキング          →  RANK/DENSE_RANK（順位）
+```
+
+**重要な組み合わせ:**
+- **CASE式 + ウィンドウ関数** = 条件付きループ処理
+- **LAG + SIGN + CASE** = 増減判定
+- **ROW_NUMBER + 条件** = 最初/最後の行特定
+
+**参照:**
+- [knowledge/anti-patterns.md](./anti-patterns.md#ぐるぐる系n1問題) - N+1問題の詳細
