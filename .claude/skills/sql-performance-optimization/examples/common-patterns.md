@@ -469,3 +469,293 @@ GROUP BY
 - `COUNT + CASE`: ELSE句不要（NULLを除外）
 - `AVG/MAX/MIN + CASE`: ELSE句不要（NULLを除外）
 - GROUP BY句には列名だけでなく、**CASE式や計算式**も書ける
+
+---
+
+## ウィンドウ関数による順序処理パターン
+
+> 「連続する数値は `num - ROW_NUMBER()` が同じ値になる」
+
+### パターン9: 欠番（断絶区間）を検出
+
+#### 用途
+テーブル内の連番の欠けている部分を検出する
+
+#### 基本形
+```sql
+SELECT num + 1 AS gap_start,
+       (num + diff - 1) AS gap_end
+FROM (SELECT num,
+             MAX(num) OVER (
+                 ORDER BY num
+                 ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING
+             ) - num AS diff
+      FROM Numbers) TMP
+WHERE diff <> 1;
+```
+
+#### 実例: 在庫番号の欠番検出
+
+```sql
+-- テーブル: [1, 3, 4, 7, 8, 9, 12]
+-- 欲しい結果: 欠番のシーケンス
+--   2〜2, 5〜6, 10〜11
+
+SELECT stock_num + 1 AS gap_start,
+       stock_num + (next_num - stock_num - 1) AS gap_end
+FROM (SELECT stock_num,
+             LEAD(stock_num) OVER (ORDER BY stock_num) AS next_num
+      FROM StockNumbers) TMP
+WHERE next_num - stock_num > 1;
+```
+
+**仕組み:**
+| stock_num | next_num | diff | gap_start | gap_end |
+|-----------|----------|------|-----------|---------|
+| 1 | 3 | 2 | 2 | 2 | ← 2〜2が欠番
+| 3 | 4 | 1 | - | - | （連続）
+| 4 | 7 | 3 | 5 | 6 | ← 5〜6が欠番
+| 7 | 8 | 1 | - | - | （連続）
+| 8 | 9 | 1 | - | - | （連続）
+| 9 | 12 | 3 | 10 | 11 | ← 10〜11が欠番
+
+**ロジック:**
+- LEAD関数で次の値を取得
+- 差が1より大きければ欠番あり
+- `gap_start = num + 1`（欠番の開始）
+- `gap_end = next_num - 1`（欠番の終了）
+
+#### 応用: 座席番号の空き検出
+
+```sql
+-- 予約済み座席から空いている座席範囲を検出
+SELECT seat_num + 1 AS available_start,
+       next_seat - 1 AS available_end,
+       (next_seat - seat_num - 1) AS available_count
+FROM (SELECT seat_num,
+             LEAD(seat_num) OVER (ORDER BY seat_num) AS next_seat
+      FROM ReservedSeats) TMP
+WHERE next_seat - seat_num > 1;
+```
+
+---
+
+### パターン10: 連続するシーケンスを求める
+
+#### 用途
+連続する値をグループ化して、連続する塊（開始〜終了）を取得する
+
+#### 基本形（エレガント）
+```sql
+SELECT MIN(num) AS start_num,
+       MAX(num) AS end_num,
+       COUNT(*) AS count
+FROM (SELECT num,
+             num - ROW_NUMBER() OVER (ORDER BY num) AS group_id
+      FROM Numbers) RankedNumbers
+GROUP BY group_id;
+```
+
+#### 実例: ログイン連続日数
+
+```sql
+-- テーブル: [1, 3, 4, 7, 8, 9, 12]
+-- 欲しい結果: 連続する塊
+--   1〜1 (1日), 3〜4 (2日), 7〜9 (3日), 12〜12 (1日)
+
+SELECT MIN(login_date) AS streak_start,
+       MAX(login_date) AS streak_end,
+       COUNT(*) AS consecutive_days
+FROM (SELECT login_date,
+             DATE_SUB(login_date, INTERVAL ROW_NUMBER() OVER (ORDER BY login_date) DAY) AS group_id
+      FROM LoginLog) RankedLogins
+GROUP BY group_id;
+```
+
+**仕組み:**
+| num | ROW_NUMBER | group_id (差分) |
+|-----|------------|-----------------|
+| 1 | 1 | 0 | ← 同じgroup_idは
+| 3 | 2 | 1 | ← 連続する塊
+| 4 | 3 | 1 | ←
+| 7 | 4 | 3 | ← 新しい塊
+| 8 | 5 | 3 | ←
+| 9 | 6 | 3 | ←
+| 12 | 7 | 5 | ← また新しい塊
+
+**ロジック:**
+- **連続する数値は `num - ROW_NUMBER()` が同じ値になる**
+- group_idでGROUP BYすると連続塊ごとに集約
+- MIN/MAXで開始・終了を取得
+
+#### 応用: 在庫の連続欠品期間
+
+```sql
+-- 欠品日の連続期間を検出
+SELECT MIN(out_of_stock_date) AS shortage_start,
+       MAX(out_of_stock_date) AS shortage_end,
+       DATEDIFF(MAX(out_of_stock_date), MIN(out_of_stock_date)) + 1 AS days
+FROM (SELECT out_of_stock_date,
+             DATE_SUB(out_of_stock_date,
+                      INTERVAL ROW_NUMBER() OVER (ORDER BY out_of_stock_date) DAY
+             ) AS group_id
+      FROM StockStatus
+      WHERE status = 'OUT_OF_STOCK') Grouped
+GROUP BY group_id;
+```
+
+---
+
+### パターン11: 中央値（メジアン）を求める
+
+#### 用途
+データの中央値を取得する（統計処理）
+
+#### 基本形
+```sql
+-- 両端から数えてぶつかった地点が中央
+SELECT AVG(value)
+FROM (SELECT value,
+             ROW_NUMBER() OVER (ORDER BY value ASC) AS hi,
+             ROW_NUMBER() OVER (ORDER BY value DESC) AS lo
+      FROM Measurements) TMP
+WHERE hi IN (lo, lo+1, lo-1);
+```
+
+#### 実例: 売上の中央値
+
+```sql
+-- データ: [100, 150, 200, 250, 300]
+-- 中央値: 200
+
+SELECT AVG(sales)
+FROM (SELECT sales,
+             ROW_NUMBER() OVER (ORDER BY sales ASC) AS ascending_rank,
+             ROW_NUMBER() OVER (ORDER BY sales DESC) AS descending_rank
+      FROM DailySales) Ranked
+WHERE ascending_rank IN (descending_rank, descending_rank + 1, descending_rank - 1);
+```
+
+**仕組み:**
+| sales | hi (昇順) | lo (降順) |
+|-------|-----------|-----------|
+| 100 | 1 | 5 | ← 両端
+| 150 | 2 | 4 | ←
+| 200 | 3 | 3 | ← ぶつかった！中央
+| 250 | 4 | 2 | ←
+| 300 | 5 | 1 | ← 両端
+
+**ロジック:**
+- `hi`: 昇順で番号付け
+- `lo`: 降順で番号付け
+- **両端から数えてぶつかった地点が中央**
+- `hi IN (lo, lo+1, lo-1)` で偶数個にも対応
+
+#### 偶数個の場合
+
+**データ: [100, 150, 200, 250]**
+| sales | hi | lo | 条件判定 |
+|-------|----|----|---------|
+| 100 | 1 | 4 | - |
+| 150 | 2 | 3 | ✅ (hi = lo+1) |
+| 200 | 3 | 2 | ✅ (hi = lo-1) |
+| 250 | 4 | 1 | - |
+
+**中央値:** AVG(150, 200) = 175
+
+---
+
+### パターン12: グループ内順位付け
+
+#### 用途
+カテゴリ別のランキング、売上TOP3など
+
+#### 基本形
+```sql
+SELECT category, product_name, sales,
+       ROW_NUMBER() OVER (PARTITION BY category ORDER BY sales DESC) AS rank
+FROM Products;
+```
+
+#### 実例: カテゴリ別TOP3商品
+
+```sql
+SELECT *
+FROM (SELECT category, product_name, sales,
+             ROW_NUMBER() OVER (
+                 PARTITION BY category
+                 ORDER BY sales DESC
+             ) AS rank
+      FROM Products) Ranked
+WHERE rank <= 3;
+```
+
+**結果:**
+| category | product_name | sales | rank |
+|----------|--------------|-------|------|
+| 電化製品 | テレビ | 100000 | 1 |
+| 電化製品 | 冷蔵庫 | 80000 | 2 |
+| 電化製品 | 洗濯機 | 60000 | 3 |
+| 食品 | お米 | 50000 | 1 |
+| 食品 | 肉 | 40000 | 2 |
+| 食品 | 魚 | 30000 | 3 |
+
+#### 応用: 各月の売上TOP1
+
+```sql
+SELECT *
+FROM (SELECT DATE_FORMAT(sale_date, '%Y-%m') AS month,
+             product_name, sales,
+             ROW_NUMBER() OVER (
+                 PARTITION BY DATE_FORMAT(sale_date, '%Y-%m')
+                 ORDER BY sales DESC
+             ) AS rank
+      FROM DailySales) Ranked
+WHERE rank = 1;
+```
+
+---
+
+## まとめ（順序処理パターン）
+
+### ウィンドウ関数の順序処理
+
+| パターン | 用途 | 主要関数 |
+|---------|------|---------|
+| **欠番検出** | 連番の欠けている部分を検出 | LEAD/LAG, ROWS BETWEEN |
+| **連続シーケンス** | 連続する塊を検出 | `num - ROW_NUMBER` |
+| **中央値** | 統計処理（メジアン） | ROW_NUMBER(昇順/降順) |
+| **グループ内順位** | カテゴリ別ランキング | PARTITION BY + ORDER BY |
+
+### キーテクニック
+
+**連続塊の検出:**
+```sql
+num - ROW_NUMBER() OVER (ORDER BY num) AS group_id
+```
+→ **連続する数値は同じgroup_idになる**
+
+**中央値の取得:**
+```sql
+ROW_NUMBER() OVER (ORDER BY value ASC) AS hi,
+ROW_NUMBER() OVER (ORDER BY value DESC) AS lo
+WHERE hi IN (lo, lo+1, lo-1)
+```
+→ **両端から数えてぶつかる地点が中央**
+
+**欠番の検出:**
+```sql
+LEAD(num) OVER (ORDER BY num) - num > 1
+```
+→ **次の値との差が1より大きければ欠番**
+
+### メリット
+
+✅ 自己結合を消去できる
+✅ テーブルアクセス1回で済む
+✅ 実行計画がシンプルで安定
+✅ アプリケーション側のループ不要
+
+**参照:**
+- [knowledge/window-functions.md](../knowledge/window-functions.md#sqlと順序順序処理の応用パターン) - ウィンドウ関数の詳細解説
+- [knowledge/anti-patterns.md](../knowledge/anti-patterns.md#シーケンスidentity列の乱用) - シーケンス/IDENTITYの問題点

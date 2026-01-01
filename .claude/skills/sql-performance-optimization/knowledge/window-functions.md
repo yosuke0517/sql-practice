@@ -895,3 +895,364 @@ FROM Sales;
 - [knowledge/subquery-problems.md](./subquery-problems.md) - サブクエリの問題点
 - [knowledge/anti-patterns.md](./anti-patterns.md#サブクエリパラノイア) - サブクエリ・パラノイア
 - [tasks/review-query.md](../tasks/review-query.md#5-サブクエリ) - サブクエリチェックリスト
+
+---
+
+## SQLと順序──順序処理の応用パターン
+
+> 「SQLに手続き型が復活した。集合指向 + 手続き型 のハイブリッド言語に進化」
+
+### SQLと順序の歴史
+
+#### 伝統的なSQL（純粋な集合指向）
+
+```
+集合理論に基づく設計:
+  - テーブルの行に順序はない
+  - ループを排除
+  - 連番を扱う機能がなかった
+  - 「何を取得するか」だけを記述（宣言型）
+```
+
+**問題点:**
+- 現実のビジネスロジックは手続き的
+- 順序が必要な処理（ランキング、連番、前後比較）が苦手
+- アプリケーション側でループ処理が必要
+
+#### 現在のSQL（ハイブリッド）
+
+```
+SQL:2003 でウィンドウ関数が導入:
+  - 行の順序を扱える
+  - 手続き型の考え方がSQLに復活
+  - 集合指向 + 手続き型 の融合
+```
+
+**メリット:**
+- 順序処理をSQL側で完結
+- アプリケーション側のループ不要
+- パフォーマンス向上（DB内で処理）
+
+---
+
+### ナンバリング（連番生成）
+
+#### 基本: ROW_NUMBERで連番を振る
+
+```sql
+-- 全行に連番を振る
+SELECT student_id,
+       ROW_NUMBER() OVER (ORDER BY student_id) AS seq
+FROM Weights;
+```
+
+**結果:**
+| student_id | seq |
+|------------|-----|
+| A100 | 1 |
+| A101 | 2 |
+| A124 | 3 |
+| B343 | 4 |
+
+#### ❌ 昔の方法（相関サブクエリ）← 使うな
+
+```sql
+-- 古い方法: 遅い
+SELECT student_id,
+       (SELECT COUNT(*)
+        FROM Weights W2
+        WHERE W2.student_id <= W1.student_id) AS seq
+FROM Weights W1;
+```
+
+**問題:**
+- テーブルに2回アクセス
+- 外側の行ごとにサブクエリ実行
+- **O(N²)の計算量** → 遅い
+
+**ROW_NUMBERとの比較:**
+```
+相関サブクエリ: O(N²) → 1万行で1億回比較
+ROW_NUMBER:    O(N log N) → 1万行で約13万回比較（約800倍高速）
+```
+
+#### グループごとに連番を振る
+
+```sql
+-- クラスごとに1から始まる連番
+SELECT class, student_id,
+       ROW_NUMBER() OVER (
+           PARTITION BY class
+           ORDER BY student_id
+       ) AS seq
+FROM Weights2;
+```
+
+**結果:**
+| class | student_id | seq |
+|-------|------------|-----|
+| 1 | 100 | 1 |  ← クラス1内で1から
+| 1 | 101 | 2 |
+| 1 | 102 | 3 |
+| 2 | 100 | 1 |  ← クラス2内で1から
+| 2 | 101 | 2 |
+
+**活用例:**
+- ページング（1ページ目、2ページ目...）
+- グループ内順位
+- 重複行の除去（seq = 1 の行だけ取得）
+
+---
+
+### ナンバリングの応用1: 中央値（メジアン）を求める
+
+#### 問題: 中央値の定義
+
+```
+データ: [1, 3, 5, 7, 9]
+中央値: 5（真ん中の値）
+
+データ: [1, 3, 5, 7] （偶数個）
+中央値: (3 + 5) / 2 = 4（真ん中2つの平均）
+```
+
+#### ❌ 集合指向的な解（自己結合）
+
+```sql
+-- 複雑で遅い（自己結合が発生）
+SELECT AVG(weight)
+FROM (SELECT W1.weight
+      FROM Weights W1, Weights W2
+      GROUP BY W1.weight
+      HAVING SUM(CASE WHEN W2.weight >= W1.weight THEN 1 ELSE 0 END) >= COUNT(*)/2
+         AND SUM(CASE WHEN W2.weight <= W1.weight THEN 1 ELSE 0 END) >= COUNT(*)/2
+     ) TMP;
+```
+
+**問題:**
+- 自己結合が発生
+- 理解が困難
+- 性能が悪い
+
+#### ✅ 手続き型の解（ウィンドウ関数）
+
+```sql
+-- シンプルで速い
+SELECT AVG(weight)
+FROM (SELECT weight,
+             ROW_NUMBER() OVER (ORDER BY weight ASC) AS hi,
+             ROW_NUMBER() OVER (ORDER BY weight DESC) AS lo
+      FROM Weights) TMP
+WHERE hi IN (lo, lo+1, lo-1);
+```
+
+**仕組み:**
+```
+weight | hi | lo
+-------|----|-----
+1      | 1  | 5  ← 両端
+3      | 2  | 4  ←
+5      | 3  | 3  ← ぶつかった！中央
+7      | 4  | 2  ←
+9      | 5  | 1  ← 両端
+```
+
+**ロジック:**
+- `hi`: 昇順で番号付け
+- `lo`: 降順で番号付け
+- **両端から数えてぶつかった地点が中央**
+- `hi IN (lo, lo+1, lo-1)` で偶数個にも対応
+
+---
+
+### ROWS BETWEEN（行間比較）
+
+#### 基本構文
+
+```sql
+関数 OVER (
+    ORDER BY ソート順
+    ROWS BETWEEN 開始位置 AND 終了位置
+)
+```
+
+**位置指定:**
+- `CURRENT ROW`: 現在行
+- `1 PRECEDING`: 1行前
+- `1 FOLLOWING`: 1行後
+- `UNBOUNDED PRECEDING`: 先頭から
+- `UNBOUNDED FOLLOWING`: 最後まで
+
+#### 例: 1行後の値を取得
+
+```sql
+SELECT num,
+       MAX(num) OVER (
+           ORDER BY num
+           ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING
+       ) AS next_num
+FROM Numbers;
+```
+
+**結果:**
+| num | next_num |
+|-----|----------|
+| 1 | 3 |
+| 3 | 4 |
+| 4 | 7 |
+| 7 | NULL |
+
+**用途:**
+- 欠番検出（`next_num - num > 1` なら欠番あり）
+- 連続判定
+
+#### 例: 移動平均（3行平均）
+
+```sql
+SELECT date, sales,
+       AVG(sales) OVER (
+           ORDER BY date
+           ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+       ) AS moving_avg_3
+FROM DailySales;
+```
+
+**結果:**
+| date | sales | moving_avg_3 |
+|------|-------|--------------|
+| 2024-01-01 | 100 | (100+150)/2 = 125 |
+| 2024-01-02 | 150 | (100+150+200)/3 = 150 |
+| 2024-01-03 | 200 | (150+200+180)/3 = 176.7 |
+| 2024-01-04 | 180 | (200+180)/2 = 190 |
+
+---
+
+### ナンバリングの応用2: 欠番（断絶区間）を求める
+
+#### 問題
+
+```
+テーブル: [1, 3, 4, 7, 8, 9, 12]
+欲しい結果: 欠番のシーケンス
+  2〜2, 5〜6, 10〜11
+```
+
+#### 手続き型の解
+
+```sql
+SELECT num + 1 AS gap_start,
+       (num + diff - 1) AS gap_end
+FROM (SELECT num,
+             MAX(num) OVER (
+                 ORDER BY num
+                 ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING
+             ) - num AS diff
+      FROM Numbers) TMP
+WHERE diff <> 1;
+```
+
+**仕組み:**
+```
+num | next_num | diff | gap_start | gap_end
+----|----------|------|-----------|--------
+1   | 3        | 2    | 2         | 2      ← 2〜2が欠番
+3   | 4        | 1    | -         | -      （連続）
+4   | 7        | 3    | 5         | 6      ← 5〜6が欠番
+7   | 8        | 1    | -         | -      （連続）
+8   | 9        | 1    | -         | -      （連続）
+9   | 12       | 3    | 10        | 11     ← 10〜11が欠番
+```
+
+**ロジック:**
+- 「カレント行と1行後の差が1でなければ欠番」
+- `gap_start = num + 1`（欠番の開始）
+- `gap_end = num + diff - 1`（欠番の終了）
+
+---
+
+### ナンバリングの応用3: 連続するシーケンスを求める
+
+#### 問題
+
+```
+テーブル: [1, 3, 4, 7, 8, 9, 12]
+欲しい結果: 連続する塊
+  1〜1, 3〜4, 7〜9, 12〜12
+```
+
+#### 手続き型の解（エレガント）
+
+```sql
+SELECT MIN(num) AS start_num,
+       MAX(num) AS end_num
+FROM (SELECT num,
+             num - ROW_NUMBER() OVER (ORDER BY num) AS group_id
+      FROM Numbers) RankedNumbers
+GROUP BY group_id;
+```
+
+**仕組み:**
+```
+num | ROW_NUMBER | group_id (差分)
+----|------------|----------------
+1   | 1          | 0   ← 同じgroup_idは
+3   | 2          | 1   ← 連続する塊
+4   | 3          | 1   ←
+7   | 4          | 3   ← 新しい塊
+8   | 5          | 3   ←
+9   | 6          | 3   ←
+12  | 7          | 5   ← また新しい塊
+```
+
+**ロジック:**
+- **連続する数値は `num - ROW_NUMBER()` が同じ値になる**
+- group_idでGROUP BYすると連続塊ごとに集約
+- MIN/MAXで開始・終了を取得
+
+**応用:**
+- 在庫の連続欠品期間
+- ログイン連続日数
+- 連続稼働時間
+
+---
+
+## まとめ
+
+### SQLの進化
+
+```
+伝統的SQL:  集合指向のみ
+現在のSQL:  集合指向 + 手続き型（ハイブリッド）
+```
+
+### ウィンドウ関数の順序処理
+
+| 処理 | 関数 | 用途 |
+|------|------|------|
+| **連番生成** | ROW_NUMBER | ページング、重複除去 |
+| **順位付け** | RANK/DENSE_RANK | ランキング |
+| **前後参照** | LAG/LEAD | 前年比、増減判定 |
+| **行間比較** | ROWS BETWEEN | 欠番検出、移動平均 |
+| **中央値** | ROW_NUMBER(昇順/降順) | 統計処理 |
+| **連続塊** | num - ROW_NUMBER | 連続期間検出 |
+
+### メリット
+
+✅ 自己結合を消去できる
+✅ テーブルアクセス1回で済む
+✅ 実行計画がシンプルで安定
+✅ アプリケーション側のループ不要
+✅ パフォーマンス向上
+
+### 相関サブクエリとの比較
+
+| 処理 | 相関サブクエリ | ROW_NUMBER |
+|------|--------------|------------|
+| テーブルアクセス | 2回 | 1回 |
+| 計算量 | O(N²) | O(N log N) |
+| 可読性 | 低い | 高い |
+| 性能 | 遅い | 速い |
+
+**参照:**
+- [examples/common-patterns.md](../examples/common-patterns.md#ウィンドウ関数による順序処理パターン) - 欠番検出、連続シーケンス検出
+- [knowledge/anti-patterns.md](./anti-patterns.md#シーケンスidentity列の乱用) - シーケンス/IDENTITYの問題点

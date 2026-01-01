@@ -808,3 +808,301 @@ FROM句にサブクエリがある？
 - [knowledge/subquery-problems.md](./subquery-problems.md) - サブクエリの問題点の詳細
 - [knowledge/window-functions.md](./window-functions.md#サブクエリからウィンドウ関数への置き換え) - ウィンドウ関数への置き換えパターン
 - [tasks/review-query.md](../tasks/review-query.md#5-サブクエリ) - サブクエリチェックリスト
+
+---
+
+## シーケンス/IDENTITY列の乱用
+
+> 「シーケンス・IDENTITY列は排他制御のボトルネックとホットスポット問題を引き起こす」
+
+### 概要
+
+**シーケンスオブジェクト**と**IDENTITY列**（MySQL: AUTO_INCREMENT）は、自動で連番を生成する便利な機能だが、性能問題の火薬庫でもある。
+
+**問題の本質:**
+- 排他制御がボトルネック
+- インデックスのホットスポット問題
+- 分散DBでは特に深刻
+- スケーラビリティを損なう
+
+---
+
+### 問題点1: 排他制御がボトルネック
+
+#### シーケンスの動作
+
+```
+トランザクション1: SELECT nextval('seq_id')  → 1 を取得
+トランザクション2: SELECT nextval('seq_id')  → 待機...
+トランザクション1: COMMIT
+トランザクション2: → 2 を取得
+```
+
+**問題:**
+- シーケンス取得時に**排他ロック**が発生
+- 並行トランザクションが待たされる
+- 高負荷時のボトルネック
+
+#### 実測例
+
+```
+並行トランザクション数とスループット:
+  1トランザクション:   1000 TPS
+  10トランザクション:  500 TPS  （半減）
+  100トランザクション: 100 TPS  （1/10）
+```
+
+**原因:**
+- シーケンス値の採番が直列化される
+- 並行度が上がると性能が劣化
+
+---
+
+### 問題点2: インデックスのホットスポット問題
+
+#### 連番キーの挿入
+
+```sql
+CREATE TABLE Orders (
+    order_id INT PRIMARY KEY AUTO_INCREMENT,
+    ...
+);
+
+-- 挿入順序
+INSERT INTO Orders VALUES (1, ...);
+INSERT INTO Orders VALUES (2, ...);
+INSERT INTO Orders VALUES (3, ...);
+...
+```
+
+**何が起きるか:**
+```
+B-Treeインデックス:
+              [root]
+             /      \
+    [1-1000]        [1001-2000]
+                           ↑
+                    常にここに挿入（ホットスポット）
+```
+
+**問題:**
+- インデックスの**最右端のページ**にのみ挿入
+- ページ分割が頻発
+- バッファキャッシュが効かない
+- 排他ロックの競合が発生
+
+#### UUIDとの比較
+
+```
+連番キー:
+  - 挿入位置が集中 → ホットスポット
+  - 高速だが並行性が低い
+
+UUID:
+  - 挿入位置が分散 → ホットスポット回避
+  - インデックスサイズ大（16バイト vs 4バイト）
+  - シーケンシャルスキャンが遅い
+```
+
+---
+
+### 問題点3: 分散DBでの問題
+
+#### NewSQL/分散DBの課題
+
+```
+ノード1: シーケンス値 1, 2, 3...
+ノード2: シーケンス値 ???
+ノード3: シーケンス値 ???
+```
+
+**問題:**
+- 分散環境で一意な連番を生成するのは**非常に困難**
+- ノード間の調整が必要 → ネットワーク遅延
+- スケールアウトの障害
+
+#### 分散DBでの代替案
+
+```
+1. UUID/GUID:
+   - ノード間調整不要
+   - ランダム生成で一意性保証
+
+2. Snowflake ID:
+   - タイムスタンプ + ノードID + 連番
+   - ソート可能なUUID
+
+3. 範囲分割:
+   - ノード1: 1-1000000
+   - ノード2: 1000001-2000000
+   - 事前に範囲を割り当て
+```
+
+---
+
+### 問題点4: 欠番の発生
+
+#### ROLLBACKによる欠番
+
+```sql
+BEGIN;
+INSERT INTO Orders (order_id, ...) VALUES (100, ...);
+-- order_id = 100 が採番される
+ROLLBACK;
+-- 100は使われず欠番になる
+
+BEGIN;
+INSERT INTO Orders (order_id, ...) VALUES (?, ...);
+-- order_id = 101 が採番される（100は飛ばされる）
+```
+
+**問題:**
+- ロールバックやエラーで欠番が発生
+- 連番の連続性が保証されない
+- 「ID=100が存在しない」トラブル
+
+---
+
+### 解決策と代替案
+
+#### 1. シーケンスよりIDENTITY列を使う（MySQL: AUTO_INCREMENT）
+
+```sql
+-- ❌ シーケンスオブジェクト（PostgreSQL）
+CREATE SEQUENCE order_id_seq;
+INSERT INTO Orders (order_id, ...)
+VALUES (nextval('order_id_seq'), ...);
+
+-- ✅ IDENTITY列（MySQL: AUTO_INCREMENT）
+CREATE TABLE Orders (
+    order_id INT PRIMARY KEY AUTO_INCREMENT,
+    ...
+);
+INSERT INTO Orders (...) VALUES (...);
+-- order_idは自動採番
+```
+
+**理由:**
+- IDENTITY列はDBMSが最適化
+- キャッシュやバッファが効く
+
+#### 2. キャッシュオプションを使う（PostgreSQL）
+
+```sql
+CREATE SEQUENCE order_id_seq CACHE 100;
+```
+
+**効果:**
+- 100個分を事前にメモリに確保
+- 排他ロックの頻度が1/100に
+
+**注意:**
+- サーバー再起動で100個飛ぶ
+- 欠番が増える
+
+#### 3. NOORDERオプション（Oracle）
+
+```sql
+CREATE SEQUENCE order_id_seq NOORDER;
+```
+
+**効果:**
+- 順序保証をなくす代わりに性能向上
+- 並行性が向上
+
+#### 4. UUIDを使う
+
+```sql
+CREATE TABLE Orders (
+    order_id CHAR(36) PRIMARY KEY DEFAULT (UUID()),
+    ...
+);
+```
+
+**メリット:**
+- 排他制御不要
+- 分散環境でも一意性保証
+- ホットスポット回避
+
+**デメリット:**
+- インデックスサイズ大（16バイト）
+- 可読性低い
+- シーケンシャルスキャンが遅い
+
+#### 5. ROW_NUMBERで後付け連番
+
+```sql
+-- 連番はビュー定義で付与
+CREATE VIEW OrdersWithSeq AS
+SELECT ROW_NUMBER() OVER (ORDER BY created_at) AS seq,
+       order_id, ...
+FROM Orders;
+```
+
+**メリット:**
+- 排他制御不要
+- ホットスポット回避
+- 欠番なし（常に詰めた連番）
+
+**デメリット:**
+- 毎回計算が必要
+- UPDATEで順序が変わる可能性
+
+---
+
+### 判断フロー
+
+```
+連番が本当に必要か？
+├─ NO  → UUID/GUID を使う
+└─ YES → 次へ
+
+順序の厳密性が必要か？
+├─ NO  → NOORDER/CACHE オプション
+└─ YES → 次へ
+
+分散環境か？
+├─ YES → UUID/Snowflake ID
+└─ NO  → 次へ
+
+高負荷・高並行性か？
+├─ YES → UUID または キャッシュ付きシーケンス
+└─ NO  → IDENTITY列（AUTO_INCREMENT）を慎重に使う
+```
+
+---
+
+### まとめ
+
+**本書のスタンス:**
+```
+シーケンスオブジェクト・IDENTITY列は極力使うな
+```
+
+**理由:**
+❌ 排他制御がボトルネック
+❌ インデックスのホットスポット問題
+❌ 分散DBでスケールしない
+❌ 欠番が発生する
+
+**どうしても使うなら:**
+1. **IDENTITY列 > シーケンスオブジェクト**（DBMSの最適化が効く）
+2. **CAC HEオプション**を使う（排他ロック削減）
+3. **NOORDERオプション**を使う（順序保証を緩める）
+
+**代替案:**
+✅ **UUID/GUID**（分散環境で最適）
+✅ **Snowflake ID**（ソート可能なUUID）
+✅ **ROW_NUMBER**（後付け連番）
+✅ **タイムスタンプ+ランダム値**
+
+**設計方針:**
+- 「連番が本当に必要か？」を問い直す
+- ビジネス要件とパフォーマンスのトレードオフ
+- 分散環境を見据えた設計
+
+---
+
+**参照:**
+- [knowledge/window-functions.md](./window-functions.md#sqlと順序順序処理の応用パターン) - ROW_NUMBERによる連番生成
+- [examples/common-patterns.md](../examples/common-patterns.md) - ウィンドウ関数パターン
