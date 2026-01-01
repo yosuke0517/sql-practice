@@ -252,3 +252,220 @@ SUM(CASE WHEN condition THEN amount ELSE 0 END)
 - `SUM + CASE`: ELSE 0 が必要
 - `COUNT + CASE`: ELSE句不要（NULLを除外）
 - `AVG/MAX/MIN + CASE`: ELSE句不要（NULLを除外）
+
+---
+
+## 非集約テーブル → 集約テーブル変換
+
+### パターン7: 行持ちテーブルを列持ちテーブルに変換
+
+#### 用途
+1人のデータが複数行に分散しているテーブルを、1人1行にまとめる
+
+#### Before（非集約テーブル）
+| id | data_type | data_1 | data_2 | data_3 | data_4 | data_5 | data_6 |
+|----|-----------|--------|--------|--------|--------|--------|--------|
+| Jim | A | 100 | 10 | NULL | NULL | NULL | NULL |
+| Jim | B | NULL | NULL | 167 | 77 | 90 | NULL |
+| Jim | C | NULL | NULL | NULL | NULL | NULL | 457 |
+
+**問題点:**
+- 1人が3行に分散
+- 横に並べたい
+
+#### After（集約テーブル）
+| id | data_1 | data_2 | data_3 | data_4 | data_5 | data_6 |
+|----|--------|--------|--------|--------|--------|--------|
+| Jim | 100 | 10 | 167 | 77 | 90 | 457 |
+
+**メリット:**
+- 1人1行
+- 見やすい
+- アプリケーションでの処理が簡単
+
+#### 基本形: CASE式 + GROUP BY + MAX
+```sql
+SELECT id,
+       MAX(CASE WHEN data_type = 'A' THEN data_1 END) AS data_1,
+       MAX(CASE WHEN data_type = 'A' THEN data_2 END) AS data_2,
+       MAX(CASE WHEN data_type = 'B' THEN data_3 END) AS data_3,
+       MAX(CASE WHEN data_type = 'B' THEN data_4 END) AS data_4,
+       MAX(CASE WHEN data_type = 'B' THEN data_5 END) AS data_5,
+       MAX(CASE WHEN data_type = 'C' THEN data_6 END) AS data_6
+FROM NonAggTbl
+GROUP BY id;
+```
+
+#### なぜMAXを使うのか？
+
+**各グループ内のデータ:**
+```
+id=Jimのグループ:
+  CASE WHEN data_type = 'A' THEN data_1 END → [100, NULL, NULL]
+  CASE WHEN data_type = 'A' THEN data_2 END → [10, NULL, NULL]
+  ...
+```
+
+**MAX関数の役割:**
+- NULLを除外して残った値を取り出す
+- `MAX([100, NULL, NULL])` → `100`
+- `MAX([10, NULL, NULL])` → `10`
+
+**注意:** 値が1つしかない前提（複数あるとMAXが適用される）
+
+#### GROUP BYの制約を理解する
+
+GROUP BYで集約すると、SELECT句に書けるのは：
+1. **定数**
+2. **集約キー**（GROUP BY句で指定した列）
+3. **集約関数**（COUNT, SUM, AVG, MAX, MIN）
+
+```sql
+-- ❌ 間違い: 集約関数なしでdata_1を直接SELECT
+SELECT id, data_1  -- data_1はGROUP BY句にない
+FROM NonAggTbl
+GROUP BY id;
+
+-- ✅ 正しい: 集約関数を使う
+SELECT id, MAX(data_1)
+FROM NonAggTbl
+GROUP BY id;
+```
+
+#### 応用: 複数の条件で列を切り替え
+
+```sql
+-- テストの得点を科目別に列で表示
+SELECT student_id,
+       MAX(CASE WHEN subject = '数学' THEN score END) AS math_score,
+       MAX(CASE WHEN subject = '英語' THEN score END) AS english_score,
+       MAX(CASE WHEN subject = '国語' THEN score END) AS japanese_score
+FROM TestScores
+GROUP BY student_id;
+```
+
+**Before:**
+| student_id | subject | score |
+|------------|---------|-------|
+| 1 | 数学 | 85 |
+| 1 | 英語 | 90 |
+| 1 | 国語 | 75 |
+| 2 | 数学 | 70 |
+| 2 | 英語 | 80 |
+| 2 | 国語 | 65 |
+
+**After:**
+| student_id | math_score | english_score | japanese_score |
+|------------|------------|---------------|----------------|
+| 1 | 85 | 90 | 75 |
+| 2 | 70 | 80 | 65 |
+
+---
+
+## GROUP BY + CASE式でカット（パーティション分割）
+
+### パターン8: CASE式で柔軟なグループ化
+
+#### 基本形
+```sql
+SELECT
+    CASE WHEN 条件1 THEN 'グループ1'
+         WHEN 条件2 THEN 'グループ2'
+         ELSE 'その他'
+    END AS group_name,
+    集約関数(列名)
+FROM テーブル名
+GROUP BY
+    CASE WHEN 条件1 THEN 'グループ1'
+         WHEN 条件2 THEN 'グループ2'
+         ELSE 'その他'
+    END;
+```
+
+**ポイント:** GROUP BY句には列名だけでなく、**CASE式や計算式**も書ける！
+
+#### 例1: 年齢階級でグループ化
+```sql
+SELECT
+    CASE WHEN age < 20 THEN '子供'
+         WHEN age BETWEEN 20 AND 69 THEN '成人'
+         WHEN age >= 70 THEN '老人'
+    END AS age_class,
+    COUNT(*) AS人数,
+    AVG(age) AS平均年齢
+FROM Persons
+GROUP BY
+    CASE WHEN age < 20 THEN '子供'
+         WHEN age BETWEEN 20 AND 69 THEN '成人'
+         WHEN age >= 70 THEN '老人'
+    END;
+```
+
+**結果:**
+| age_class | 人数 | 平均年齢 |
+|-----------|------|----------|
+| 子供 | 5 | 15.2 |
+| 成人 | 15 | 45.3 |
+| 老人 | 3 | 75.7 |
+
+#### 例2: 売上規模でグループ化
+```sql
+SELECT
+    CASE WHEN sales < 100000 THEN '小規模'
+         WHEN sales < 1000000 THEN '中規模'
+         ELSE '大規模'
+    END AS sales_category,
+    COUNT(*) AS店舗数,
+    AVG(sales) AS平均売上,
+    SUM(sales) AS合計売上
+FROM Shops
+GROUP BY
+    CASE WHEN sales < 100000 THEN '小規模'
+         WHEN sales < 1000000 THEN '中規模'
+         ELSE '大規模'
+    END;
+```
+
+#### 例3: 時間帯でグループ化
+```sql
+SELECT
+    CASE WHEN HOUR(access_time) < 6 THEN '深夜'
+         WHEN HOUR(access_time) < 12 THEN '午前'
+         WHEN HOUR(access_time) < 18 THEN '午後'
+         ELSE '夜間'
+    END AS time_period,
+    COUNT(*) ASアクセス数
+FROM AccessLogs
+GROUP BY
+    CASE WHEN HOUR(access_time) < 6 THEN '深夜'
+         WHEN HOUR(access_time) < 12 THEN '午前'
+         WHEN HOUR(access_time) < 18 THEN '午後'
+         ELSE '夜間'
+    END;
+```
+
+---
+
+## まとめ（更新版）
+
+**CASE式 + 集約関数の利点:**
+1. テーブルスキャンが1回で済む
+2. UNIONを使うより高速
+3. 可読性が高い
+4. メンテナンスしやすい
+5. 柔軟なグループ化が可能
+
+**主要パターン:**
+1. SUM + CASE: 条件付き集計
+2. COUNT + CASE: 条件付きカウント
+3. AVG + CASE: 条件付き平均
+4. MAX/MIN + CASE: 条件付き最大/最小
+5. CASE式のネスト: 複雑な条件分岐
+6. **MAX + CASE + GROUP BY: 行持ち→列持ち変換**
+7. **GROUP BY + CASE式: 柔軟なパーティション分割**
+
+**覚えておくべきルール:**
+- `SUM + CASE`: ELSE 0 が必要
+- `COUNT + CASE`: ELSE句不要（NULLを除外）
+- `AVG/MAX/MIN + CASE`: ELSE句不要（NULLを除外）
+- GROUP BY句には列名だけでなく、**CASE式や計算式**も書ける
