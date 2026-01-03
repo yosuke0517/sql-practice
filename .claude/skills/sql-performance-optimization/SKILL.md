@@ -30,6 +30,7 @@
 | ファイル | 内容 |
 |---------|------|
 | [anti-patterns.md](knowledge/anti-patterns.md) | 冗長性症候群、N+1問題、三角結合、サブクエリ・パラノイア、シーケンス乱用、スーパーソルジャー病 |
+| [query-antipatterns.md](knowledge/query-antipatterns.md) | スパゲッティクエリ、曖昧なグループ（GROUP BY違反）、暗黙の列（SELECT *）、LIKE検索、ランダムセレクション |
 | [window-functions.md](knowledge/window-functions.md) | GROUP BY vs PARTITION BY、LAG/LEAD/ROW_NUMBER、サブクエリ→ウィンドウ関数置換、UPDATE活用 |
 | [index-strategies.md](knowledge/index-strategies.md) | インデックスが効く条件、効かない5パターン、複合インデックス順序、カバリングインデックス |
 | [join-algorithms.md](knowledge/join-algorithms.md) | Nested Loops/Hash/Sort Merge、駆動表・内部表の選択、実行計画変動リスク |
@@ -64,6 +65,8 @@
 | ユースケース | 参照ファイル |
 |------------|-------------|
 | **クエリが遅い原因を知りたい** | [anti-patterns.md](knowledge/anti-patterns.md), [review-query.md](tasks/review-query.md) |
+| **クエリが複雑すぎる** | [query-antipatterns.md](knowledge/query-antipatterns.md) |
+| **GROUP BYでエラーが出る** | [query-antipatterns.md](knowledge/query-antipatterns.md) |
 | **インデックスを設計したい** | [index-strategies.md](knowledge/index-strategies.md) |
 | **結合が遅い** | [join-algorithms.md](knowledge/join-algorithms.md) |
 | **サブクエリを最適化したい** | [subquery-problems.md](knowledge/subquery-problems.md), [window-functions.md](knowledge/window-functions.md) |
