@@ -759,3 +759,417 @@ LEAD(num) OVER (ORDER BY num) - num > 1
 **参照:**
 - [knowledge/window-functions.md](../knowledge/window-functions.md#sqlと順序順序処理の応用パターン) - ウィンドウ関数の詳細解説
 - [knowledge/anti-patterns.md](../knowledge/anti-patterns.md#シーケンスidentity列の乱用) - シーケンス/IDENTITYの問題点
+
+---
+
+## 更新系パターン（UPDATE文でのウィンドウ関数活用）
+
+> 「更新処理でもウィンドウ関数で一括処理。テーブルアクセスを1回に減らせ」
+
+---
+
+### パターン13: NULLの埋め立て（前の値で補完）
+
+#### 用途
+NULL値を前の非NULL値で埋める（センサーデータの欠損補完など）
+
+#### Before
+| keycol | seq | val |
+|--------|-----|-----|
+| A | 1 | 50 |
+| A | 2 | NULL |
+| A | 3 | NULL |
+| A | 4 | 70 |
+
+#### After（期待する結果）
+| keycol | seq | val |
+|--------|-----|-----|
+| A | 1 | 50 |
+| A | 2 | 50 | ← 前の値で埋める
+| A | 3 | 50 | ← 前の値で埋める
+| A | 4 | 70 |
+
+---
+
+#### ❌ 相関サブクエリ版（遅い）
+
+```sql
+-- テーブルに3回アクセス
+UPDATE OmitTbl
+SET val = (SELECT val
+           FROM OmitTbl O1
+           WHERE O1.keycol = OmitTbl.keycol
+             AND O1.seq = (SELECT MAX(seq)
+                           FROM OmitTbl O2
+                           WHERE O2.keycol = OmitTbl.keycol
+                             AND O2.seq < OmitTbl.seq
+                             AND O2.val IS NOT NULL))
+WHERE val IS NULL;
+```
+
+**問題点:**
+- テーブルに3回アクセス
+- 相関サブクエリでループ
+- ネストしたサブクエリで複雑
+
+---
+
+#### ✅ ウィンドウ関数版（Oracle/SQL Server）
+
+```sql
+-- LAST_VALUE IGNORE NULLS を使用
+UPDATE OmitTbl
+SET val = (SELECT val
+           FROM (SELECT keycol, seq,
+                        LAST_VALUE(val IGNORE NULLS) OVER (
+                            PARTITION BY keycol
+                            ORDER BY seq
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                        ) AS filled_val
+                 FROM OmitTbl) tmp
+           WHERE tmp.keycol = OmitTbl.keycol
+             AND tmp.seq = OmitTbl.seq)
+WHERE val IS NULL;
+```
+
+**改善点:**
+- ✅ テーブルアクセス2回（元々3回から削減）
+- ✅ ループなし
+- ✅ 可読性が向上
+
+---
+
+#### MySQL での代替案（再帰CTE）
+
+```sql
+-- 再帰CTEで前の値を伝播
+WITH RECURSIVE filled AS (
+    -- ベースケース: seq=1の行
+    SELECT keycol, seq, val, val AS filled_val
+    FROM OmitTbl
+    WHERE seq = 1
+
+    UNION ALL
+
+    -- 再帰ケース: seq=2以降
+    SELECT o.keycol, o.seq, o.val,
+           COALESCE(o.val, f.filled_val) AS filled_val
+    FROM OmitTbl o
+    INNER JOIN filled f
+      ON o.keycol = f.keycol
+     AND o.seq = f.seq + 1
+)
+UPDATE OmitTbl o
+INNER JOIN filled f
+  ON o.keycol = f.keycol
+ AND o.seq = f.seq
+SET o.val = f.filled_val
+WHERE o.val IS NULL;
+```
+
+**メリット:**
+- MySQL 8.0+ で動作
+- 再帰的に前の値を伝播
+
+**デメリット:**
+- 再帰CTEの記述が複雑
+- seqが連番でないと動作しない
+
+---
+
+### パターン14: 行から列への更新（行持ち→列持ち UPDATE）
+
+#### 用途
+複数行に分散したデータを1行にまとめて更新する
+
+#### Before（ScoreRows）
+| student_id | subject | score |
+|------------|---------|-------|
+| A001 | 英語 | 100 |
+| A001 | 国語 | 58 |
+| A001 | 数学 | 90 |
+| B002 | 英語 | 77 |
+| B002 | 国語 | 60 |
+
+#### After（ScoreCols）
+| student_id | score_en | score_nl | score_mt |
+|------------|----------|----------|----------|
+| A001 | 100 | 58 | 90 |
+| B002 | 77 | 60 | NULL |
+
+---
+
+#### ✅ CASE式 + 集約での一括UPDATE
+
+```sql
+-- ScoreColsテーブルが既に存在する場合
+UPDATE ScoreCols
+SET score_en = (SELECT MAX(CASE WHEN subject = '英語' THEN score END)
+                FROM ScoreRows SR
+                WHERE SR.student_id = ScoreCols.student_id),
+    score_nl = (SELECT MAX(CASE WHEN subject = '国語' THEN score END)
+                FROM ScoreRows SR
+                WHERE SR.student_id = ScoreCols.student_id),
+    score_mt = (SELECT MAX(CASE WHEN subject = '数学' THEN score END)
+                FROM ScoreRows SR
+                WHERE SR.student_id = ScoreCols.student_id);
+```
+
+**改善版（サブクエリを1回に）:**
+
+```sql
+-- サブクエリを1回にまとめる
+UPDATE ScoreCols C
+INNER JOIN (
+    SELECT student_id,
+           MAX(CASE WHEN subject = '英語' THEN score END) AS en,
+           MAX(CASE WHEN subject = '国語' THEN score END) AS nl,
+           MAX(CASE WHEN subject = '数学' THEN score END) AS mt
+    FROM ScoreRows
+    GROUP BY student_id
+) SR
+  ON C.student_id = SR.student_id
+SET C.score_en = SR.en,
+    C.score_nl = SR.nl,
+    C.score_mt = SR.mt;
+```
+
+**メリット:**
+- 一括更新
+- CASE式でシンプル
+- テーブルアクセスを最小化
+
+---
+
+#### 新しいテーブルを作る場合（推奨）
+
+```sql
+-- INSERT SELECTが推奨
+CREATE TABLE ScoreCols AS
+SELECT student_id,
+       MAX(CASE WHEN subject = '英語' THEN score END) AS score_en,
+       MAX(CASE WHEN subject = '国語' THEN score END) AS score_nl,
+       MAX(CASE WHEN subject = '数学' THEN score END) AS score_mt
+FROM ScoreRows
+GROUP BY student_id;
+```
+
+---
+
+### パターン15: 前日比計算（同じテーブルの異なる行からの更新）
+
+#### 用途
+前日の価格と比較して増減を記録する
+
+#### Before
+| brand | date | price | trend |
+|-------|------|-------|-------|
+| A | 01/01 | 1000 | NULL |
+| A | 01/02 | 1050 | NULL |
+| A | 01/03 | 1050 | NULL |
+| A | 01/04 | 900 | NULL |
+
+#### After（期待する結果）
+| brand | date | price | trend |
+|-------|------|-------|-------|
+| A | 01/01 | 1000 | NULL |
+| A | 01/02 | 1050 | ↑ |
+| A | 01/03 | 1050 | → |
+| A | 01/04 | 900 | ↓ |
+
+---
+
+#### ❌ 相関サブクエリ版（遅い）
+
+```sql
+-- 複雑で読みにくい、テーブル複数回アクセス
+UPDATE Stocks
+SET trend = (SELECT CASE SIGN(Stocks.price -
+                              (SELECT price
+                               FROM Stocks S2
+                               WHERE S2.brand = Stocks.brand
+                                 AND S2.sale_date = (SELECT MAX(sale_date)
+                                                     FROM Stocks S3
+                                                     WHERE S3.brand = Stocks.brand
+                                                       AND S3.sale_date < Stocks.sale_date)))
+                  WHEN 1 THEN '↑'
+                  WHEN 0 THEN '→'
+                  WHEN -1 THEN '↓'
+             END);
+```
+
+**問題点:**
+- テーブルに3回アクセス
+- ネストしたサブクエリで複雑
+- 可読性が低い
+
+---
+
+#### ✅ ウィンドウ関数版（INSERT版 - 推奨）
+
+```sql
+-- 新しいテーブルに挿入（テーブルアクセス1回）
+INSERT INTO Stocks2
+SELECT brand, sale_date, price,
+       CASE SIGN(price - LAG(price) OVER (
+                PARTITION BY brand
+                ORDER BY sale_date
+            ))
+            WHEN 1 THEN '↑'
+            WHEN 0 THEN '→'
+            WHEN -1 THEN '↓'
+            ELSE NULL
+       END AS trend
+FROM Stocks;
+```
+
+**メリット:**
+- ✅ テーブルアクセス1回のみ
+- ✅ 結合なし
+- ✅ 可読性が高い
+- ✅ LAG関数で前の行を直接参照
+
+---
+
+#### ✅ ウィンドウ関数版（UPDATE版）
+
+```sql
+-- 既存テーブルを更新（テーブルアクセス2回）
+UPDATE Stocks S
+INNER JOIN (
+    SELECT brand, sale_date,
+           CASE SIGN(price - LAG(price) OVER (
+                    PARTITION BY brand
+                    ORDER BY sale_date
+                ))
+                WHEN 1 THEN '↑'
+                WHEN 0 THEN '→'
+                WHEN -1 THEN '↓'
+                ELSE NULL
+           END AS trend_value
+    FROM Stocks
+) AS tmp
+  ON S.brand = tmp.brand
+ AND S.sale_date = tmp.sale_date
+SET S.trend = tmp.trend_value;
+```
+
+**改善点:**
+- ✅ テーブルアクセス2回（元々3回から削減）
+- ✅ 可読性が高い
+
+---
+
+### パターン16: 累積値の更新
+
+#### 用途
+累積売上を計算してテーブルに保存する
+
+#### Before
+| date | sales | cumulative_sales |
+|------|-------|------------------|
+| 01/01 | 100 | NULL |
+| 01/02 | 200 | NULL |
+| 01/03 | 150 | NULL |
+
+#### After
+| date | sales | cumulative_sales |
+|------|-------|------------------|
+| 01/01 | 100 | 100 |
+| 01/02 | 200 | 300 |
+| 01/03 | 150 | 450 |
+
+---
+
+#### ❌ ループ版（遅い）
+
+```java
+// アプリケーション側でループ
+cumulative = 0;
+for (row : sales) {
+    cumulative += row.sales;
+    UPDATE Sales SET cumulative_sales = ? WHERE date = ?;
+}
+```
+
+**問題点:**
+- N回の更新SQL発行
+- ネットワークラウンドトリップ × N
+- トランザクションログ肥大化
+
+---
+
+#### ✅ ウィンドウ関数版（速い）
+
+```sql
+-- サブクエリでSUM OVERを使い、結果で更新
+UPDATE Sales S
+INNER JOIN (
+    SELECT date,
+           SUM(sales) OVER (ORDER BY date) AS cumulative
+    FROM Sales
+) AS tmp
+  ON S.date = tmp.date
+SET S.cumulative_sales = tmp.cumulative;
+```
+
+**改善点:**
+- ✅ テーブルアクセス2回（一括処理）
+- ✅ 1回のUPDATE文で完了
+- ✅ パフォーマンス向上
+
+---
+
+## 更新系パターン まとめ
+
+### 主要パターン比較
+
+| パターン | 処理内容 | 従来の方法 | ウィンドウ関数 | アクセス削減 |
+|---------|---------|-----------|--------------|------------|
+| **13** | NULL埋め立て | 相関サブクエリ | LAST_VALUE IGNORE NULLS | 3回 → 2回 |
+| **14** | 行列変換UPDATE | 複数サブクエリ | CASE + 集約 + 結合 | N回 → 2回 |
+| **15** | 前日比計算 | 相関サブクエリ | LAG + SIGN + CASE | 3回 → 2回（INSERT版は1回） |
+| **16** | 累積値更新 | ループ | SUM OVER | N回 → 2回 |
+
+### 推奨アプローチ
+
+**新しいテーブルを作る場合:**
+```sql
+-- INSERT SELECT が推奨（テーブルアクセス1回）
+INSERT INTO NewTable
+SELECT ..., ウィンドウ関数 OVER (...) AS new_col
+FROM OldTable;
+```
+
+**既存テーブルを更新する場合:**
+```sql
+-- サブクエリ + 結合でUPDATE（テーブルアクセス2回）
+UPDATE OldTable O
+INNER JOIN (
+    SELECT key, ウィンドウ関数 OVER (...) AS new_val
+    FROM OldTable
+) AS tmp
+  ON O.key = tmp.key
+SET O.col = tmp.new_val;
+```
+
+### メリット
+
+✅ テーブルアクセス回数の削減
+✅ 一括処理で高速化
+✅ 可読性の向上
+✅ 実行計画がシンプル
+
+### 注意点
+
+⚠️ **DBMS依存性**
+- `IGNORE NULLS`: Oracle、SQL Server（PostgreSQL 11+も対応）
+- MySQL: 再帰CTEで代替
+
+⚠️ **大量データの更新**
+- 一時テーブルのメモリ使用に注意
+- TEMP落ちリスク
+
+**参照:**
+- [knowledge/window-functions.md](../knowledge/window-functions.md#update文でのウィンドウ関数活用) - UPDATE文でのウィンドウ関数の詳細
+- [knowledge/anti-patterns.md](../knowledge/anti-patterns.md#ぐるぐる系n1問題) - ループ更新の問題点

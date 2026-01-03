@@ -1256,3 +1256,409 @@ num | ROW_NUMBER | group_id (差分)
 **参照:**
 - [examples/common-patterns.md](../examples/common-patterns.md#ウィンドウ関数による順序処理パターン) - 欠番検出、連続シーケンス検出
 - [knowledge/anti-patterns.md](./anti-patterns.md#シーケンスidentity列の乱用) - シーケンス/IDENTITYの問題点
+
+---
+
+## UPDATE文でのウィンドウ関数活用
+
+> 「更新処理でもウィンドウ関数で一括処理。テーブルアクセスを1回に減らせ」
+
+### 概要
+
+UPDATE文でもウィンドウ関数を使うことで、同じテーブルへの複数回アクセスを避け、効率的な更新が可能になる。
+
+**従来の問題:**
+- 相関サブクエリでの更新 → テーブルに複数回アクセス
+- ループでの更新 → N回の更新処理
+- 自己結合での更新 → テーブルに2回アクセス
+
+**ウィンドウ関数での解決:**
+- テーブルアクセス1回
+- 一括更新
+- 実行計画がシンプル
+
+---
+
+### パターン1: NULLの埋め立て（前の値で補完）
+
+#### 問題
+
+NULL値を前の非NULL値で埋めたい
+
+**Before:**
+| keycol | seq | val |
+|--------|-----|-----|
+| A | 1 | 50 |
+| A | 2 | NULL |
+| A | 3 | NULL |
+| A | 4 | 70 |
+
+**After（期待する結果）:**
+| keycol | seq | val |
+|--------|-----|-----|
+| A | 1 | 50 |
+| A | 2 | 50 | ← 前の値で埋める
+| A | 3 | 50 | ← 前の値で埋める
+| A | 4 | 70 |
+
+---
+
+#### ❌ 相関サブクエリ版（遅い）
+
+```sql
+-- テーブルに複数回アクセス
+UPDATE OmitTbl
+SET val = (SELECT val
+           FROM OmitTbl O1
+           WHERE O1.keycol = OmitTbl.keycol
+             AND O1.seq = (SELECT MAX(seq)
+                           FROM OmitTbl O2
+                           WHERE O2.keycol = OmitTbl.keycol
+                             AND O2.seq < OmitTbl.seq
+                             AND O2.val IS NOT NULL))
+WHERE val IS NULL;
+```
+
+**問題点:**
+- テーブルに3回アクセス（OmitTbl、O1、O2）
+- 相関サブクエリで外側の行ごとにループ
+- ネストしたサブクエリで複雑
+
+**EXPLAIN例:**
+```
+-> Update on OmitTbl
+    -> Filter: (val is null)
+        -> Table scan on OmitTbl  ← 1回目
+    -> Select #2 (subquery in UPDATE)
+        -> Table scan on O1  ← 2回目
+        -> Select #3 (subquery in SELECT)
+            -> Aggregate
+                -> Filter: (O2.val is not null)
+                    -> Table scan on O2  ← 3回目
+```
+
+---
+
+#### ✅ ウィンドウ関数版（Oracle/SQL Server）
+
+```sql
+-- LAST_VALUE IGNORE NULLS を使用
+UPDATE OmitTbl
+SET val = (SELECT val
+           FROM (SELECT keycol, seq,
+                        LAST_VALUE(val IGNORE NULLS) OVER (
+                            PARTITION BY keycol
+                            ORDER BY seq
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                        ) AS filled_val
+                 FROM OmitTbl) tmp
+           WHERE tmp.keycol = OmitTbl.keycol
+             AND tmp.seq = OmitTbl.seq)
+WHERE val IS NULL;
+```
+
+**改善点:**
+- ✅ テーブルアクセス2回（元々3回から削減）
+- ✅ ループなし
+- ✅ 可読性が向上
+
+**構文:**
+- `LAST_VALUE(val IGNORE NULLS)`: 最後の非NULL値を取得
+- `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`: 先頭から現在行まで
+- `PARTITION BY keycol`: グループごとに処理
+
+---
+
+#### MySQL での代替案（再帰CTE）
+
+MySQLは `IGNORE NULLS` をサポートしていないため、再帰CTEを使う。
+
+```sql
+-- 再帰CTEで前の値を伝播
+WITH RECURSIVE filled AS (
+    -- ベースケース: seq=1の行
+    SELECT keycol, seq, val, val AS filled_val
+    FROM OmitTbl
+    WHERE seq = 1
+
+    UNION ALL
+
+    -- 再帰ケース: seq=2以降
+    SELECT o.keycol, o.seq, o.val,
+           COALESCE(o.val, f.filled_val) AS filled_val
+    FROM OmitTbl o
+    INNER JOIN filled f
+      ON o.keycol = f.keycol
+     AND o.seq = f.seq + 1
+)
+UPDATE OmitTbl o
+INNER JOIN filled f
+  ON o.keycol = f.keycol
+ AND o.seq = f.seq
+SET o.val = f.filled_val
+WHERE o.val IS NULL;
+```
+
+**メリット:**
+- MySQL 8.0+ で動作
+- 再帰的に前の値を伝播
+
+**デメリット:**
+- 再帰CTEの記述が複雑
+- seqが連番でないと動作しない
+
+---
+
+#### MySQL での代替案2（変数を使った方法）
+
+```sql
+-- ユーザー変数で前の値を保持
+UPDATE OmitTbl o
+INNER JOIN (
+    SELECT keycol, seq,
+           @prev := IF(val IS NOT NULL, val,
+                      IF(keycol = @prevKey, @prev, NULL)) AS filled_val,
+           @prevKey := keycol
+    FROM OmitTbl
+    CROSS JOIN (SELECT @prev := NULL, @prevKey := NULL) AS init
+    ORDER BY keycol, seq
+) AS tmp
+  ON o.keycol = tmp.keycol
+ AND o.seq = tmp.seq
+SET o.val = tmp.filled_val
+WHERE o.val IS NULL;
+```
+
+**注意:**
+- MySQL 8.0以降では変数の動作が変わったため、推奨されない
+- 実行計画が安定しない可能性がある
+
+---
+
+### パターン2: 前日比計算（同じテーブルの異なる行からの更新）
+
+#### 問題
+
+前日の価格と比較して増減を記録したい
+
+**Before:**
+| brand | date | price | trend |
+|-------|------|-------|-------|
+| A | 01/01 | 1000 | NULL |
+| A | 01/02 | 1050 | NULL |
+| A | 01/03 | 1050 | NULL |
+| A | 01/04 | 900 | NULL |
+
+**After（期待する結果）:**
+| brand | date | price | trend |
+|-------|------|-------|-------|
+| A | 01/01 | 1000 | NULL |
+| A | 01/02 | 1050 | ↑ |
+| A | 01/03 | 1050 | → |
+| A | 01/04 | 900 | ↓ |
+
+---
+
+#### ❌ 相関サブクエリ版（遅い）
+
+```sql
+-- 複雑で読みにくい、テーブル複数回アクセス
+UPDATE Stocks
+SET trend = (SELECT CASE SIGN(Stocks.price -
+                              (SELECT price
+                               FROM Stocks S2
+                               WHERE S2.brand = Stocks.brand
+                                 AND S2.sale_date = (SELECT MAX(sale_date)
+                                                     FROM Stocks S3
+                                                     WHERE S3.brand = Stocks.brand
+                                                       AND S3.sale_date < Stocks.sale_date)))
+                  WHEN 1 THEN '↑'
+                  WHEN 0 THEN '→'
+                  WHEN -1 THEN '↓'
+             END);
+```
+
+**問題点:**
+- テーブルに3回アクセス（Stocks、S2、S3）
+- ネストしたサブクエリで複雑
+- 可読性が低い
+
+---
+
+#### ✅ ウィンドウ関数版（速い）
+
+**INSERTで新しいテーブルを作る場合:**
+
+```sql
+-- 新しいテーブルに挿入
+INSERT INTO Stocks2
+SELECT brand, sale_date, price,
+       CASE SIGN(price - LAG(price) OVER (
+                PARTITION BY brand
+                ORDER BY sale_date
+            ))
+            WHEN 1 THEN '↑'
+            WHEN 0 THEN '→'
+            WHEN -1 THEN '↓'
+            ELSE NULL
+       END AS trend
+FROM Stocks;
+```
+
+**UPDATEで既存テーブルを更新する場合:**
+
+```sql
+-- サブクエリでウィンドウ関数を使い、結果で更新
+UPDATE Stocks S
+INNER JOIN (
+    SELECT brand, sale_date,
+           CASE SIGN(price - LAG(price) OVER (
+                    PARTITION BY brand
+                    ORDER BY sale_date
+                ))
+                WHEN 1 THEN '↑'
+                WHEN 0 THEN '→'
+                WHEN -1 THEN '↓'
+                ELSE NULL
+           END AS trend_value
+    FROM Stocks
+) AS tmp
+  ON S.brand = tmp.brand
+ AND S.sale_date = tmp.sale_date
+SET S.trend = tmp.trend_value;
+```
+
+**改善点:**
+- ✅ テーブルアクセス2回（元々3回から削減）
+- ✅ 結合なし（INSERT版の場合は1回のみ）
+- ✅ 可読性が高い
+- ✅ LAG関数で前の行を直接参照
+
+**構文:**
+- `LAG(price) OVER (...)`: 前の行の価格を取得
+- `SIGN(price - LAG(price))`: 差の符号（1/0/-1）
+- `PARTITION BY brand`: ブランドごとに処理
+- `ORDER BY sale_date`: 日付順にソート
+
+---
+
+### パターン3: 累積値の更新
+
+#### 問題
+
+累積売上を計算してテーブルに保存したい
+
+**Before:**
+| date | sales | cumulative_sales |
+|------|-------|------------------|
+| 01/01 | 100 | NULL |
+| 01/02 | 200 | NULL |
+| 01/03 | 150 | NULL |
+
+**After:**
+| date | sales | cumulative_sales |
+|------|-------|------------------|
+| 01/01 | 100 | 100 |
+| 01/02 | 200 | 300 |
+| 01/03 | 150 | 450 |
+
+---
+
+#### ❌ ループ版（遅い）
+
+```java
+// アプリケーション側でループ
+cumulative = 0;
+for (row : sales) {
+    cumulative += row.sales;
+    UPDATE Sales SET cumulative_sales = ? WHERE date = ?;
+}
+```
+
+**問題点:**
+- N回の更新SQL発行
+- ネットワークラウンドトリップ × N
+- トランザクションログ肥大化
+
+---
+
+#### ✅ ウィンドウ関数版（速い）
+
+```sql
+-- サブクエリでSUM OVERを使い、結果で更新
+UPDATE Sales S
+INNER JOIN (
+    SELECT date,
+           SUM(sales) OVER (ORDER BY date) AS cumulative
+    FROM Sales
+) AS tmp
+  ON S.date = tmp.date
+SET S.cumulative_sales = tmp.cumulative;
+```
+
+**改善点:**
+- ✅ テーブルアクセス2回（一括処理）
+- ✅ 1回のUPDATE文で完了
+- ✅ パフォーマンス向上
+
+**構文:**
+- `SUM(sales) OVER (ORDER BY date)`: 累積和を計算
+
+---
+
+## UPDATE文でのウィンドウ関数 まとめ
+
+### 主要パターン
+
+| 処理内容 | 従来の方法 | ウィンドウ関数 | テーブルアクセス削減 |
+|---------|-----------|--------------|-------------------|
+| **NULL埋め立て** | 相関サブクエリ | LAST_VALUE IGNORE NULLS | 3回 → 2回 |
+| **前日比計算** | 相関サブクエリ | LAG + SIGN + CASE | 3回 → 2回（INSERT版は1回） |
+| **累積値更新** | ループ | SUM OVER | N回 → 2回 |
+
+### メリット
+
+✅ テーブルアクセス回数の削減
+✅ 一括処理で高速化
+✅ 可読性の向上
+✅ 実行計画がシンプル
+
+### 注意点
+
+⚠️ **DBMS依存性**
+- `IGNORE NULLS`: Oracle、SQL Server（PostgreSQL 11+も対応）
+- MySQL: 再帰CTEで代替
+
+⚠️ **更新対象の特定**
+- ウィンドウ関数の結果をサブクエリで取得
+- 元のテーブルと結合してUPDATE
+
+⚠️ **大量データの更新**
+- 一時テーブルのメモリ使用に注意
+- TEMP落ちリスク
+
+### 推奨アプローチ
+
+**新しいテーブルを作る場合:**
+```sql
+-- INSERT SELECT が推奨（テーブルアクセス1回）
+INSERT INTO NewTable
+SELECT ..., ウィンドウ関数 OVER (...) AS new_col
+FROM OldTable;
+```
+
+**既存テーブルを更新する場合:**
+```sql
+-- サブクエリ + 結合でUPDATE
+UPDATE OldTable O
+INNER JOIN (
+    SELECT key, ウィンドウ関数 OVER (...) AS new_val
+    FROM OldTable
+) AS tmp
+  ON O.key = tmp.key
+SET O.col = tmp.new_val;
+```
+
+**参照:**
+- [knowledge/anti-patterns.md](./anti-patterns.md#ぐるぐる系n1問題) - ループ更新の問題点
+- [examples/common-patterns.md](../examples/common-patterns.md#パターン13-nullの埋め立て前の値で補完) - 更新系パターンの実例

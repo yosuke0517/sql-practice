@@ -1106,3 +1106,259 @@ FROM Orders;
 **参照:**
 - [knowledge/window-functions.md](./window-functions.md#sqlと順序順序処理の応用パターン) - ROW_NUMBERによる連番生成
 - [examples/common-patterns.md](../examples/common-patterns.md) - ウィンドウ関数パターン
+
+---
+
+## スーパーソルジャー病
+
+> 「賢いデータ構造と間抜けなコードのほうが、その逆よりずっとまし」
+
+### 概要
+
+**スーパーソルジャー病（Super Soldier Syndrome）** とは、難しい問題を難しいまま解こうとし、SQLで何とかしようとして複雑なクエリを書き、データモデルの問題をコードで解決しようとするアンチパターン。
+
+**問題の本質:**
+- データモデルの問題をSQLで無理やり解決しようとする
+- 複雑なクエリを書くことに満足してしまう
+- 「一歩引いてモデルを見直す」という発想がない
+- コーディングの前にモデリングを考えない
+
+---
+
+### 症状: SQLで頑張る
+
+#### 問題例: 注文ごとの商品数を取得したい
+
+```sql
+-- ❌ SQLで頑張る（結合 + 集約）
+SELECT O.order_id, O.order_name, COUNT(*) AS item_count
+FROM Orders O
+JOIN OrderReceipts ORC ON O.order_id = ORC.order_id
+GROUP BY O.order_id, O.order_name;
+```
+
+**何が起きるか:**
+- 毎回結合が発生
+- 集約処理が必要
+- インデックスが効きにくい
+- 実行計画が変動しやすい
+
+**EXPLAIN例:**
+```
+-> Group aggregate
+    -> Inner hash join  (cost=500 rows=1000)
+        -> Table scan on O  (cost=100 rows=100)
+        -> Hash
+            -> Table scan on ORC  (cost=200 rows=1000)
+```
+
+---
+
+### 処方箋: モデルを変える
+
+#### 本当の解決策: Ordersテーブルに item_count 列を追加
+
+```sql
+-- テーブル定義を変更
+ALTER TABLE Orders ADD COLUMN item_count INT DEFAULT 0;
+
+-- 既存データの更新
+UPDATE Orders O
+SET item_count = (
+    SELECT COUNT(*)
+    FROM OrderReceipts ORC
+    WHERE ORC.order_id = O.order_id
+);
+
+-- ✅ シンプルなクエリ（結合不要）
+SELECT order_id, order_name, item_count
+FROM Orders;
+```
+
+**改善点:**
+- ✅ 結合不要
+- ✅ SELECT一発で取得
+- ✅ インデックスが効く
+- ✅ 実行計画が安定
+- ✅ パフォーマンスが良い
+
+**EXPLAIN例:**
+```
+-> Table scan on Orders  (cost=100 rows=100)
+```
+
+---
+
+### モデル変更のトレードオフ
+
+#### メリット
+
+✅ **SQLがシンプルになる**
+- 複雑な結合・集約が不要
+- 可読性が向上
+- メンテナンスしやすい
+
+✅ **パフォーマンスが良くなる**
+- I/Oが削減される
+- インデックスが効きやすい
+- 実行計画が安定
+
+✅ **スケーラビリティが向上**
+- 負荷が分散される
+- キャッシュが効きやすい
+
+#### デメリット
+
+❌ **更新コストが増える（冗長データの同期）**
+```sql
+-- 商品追加時
+INSERT INTO OrderReceipts (...) VALUES (...);
+UPDATE Orders SET item_count = item_count + 1 WHERE order_id = ?;
+
+-- 商品削除時
+DELETE FROM OrderReceipts WHERE receipt_id = ?;
+UPDATE Orders SET item_count = item_count - 1 WHERE order_id = ?;
+```
+
+❌ **タイムラグが発生する（リアルタイム性の問題）**
+- 集計列の更新タイミングによってはズレが生じる
+- トランザクション管理が複雑になる
+- バッチ更新の場合は特に注意
+
+❌ **後からの変更は大変**
+- 開発終盤・本番運用中は特に困難
+- データ移行が必要
+- ダウンタイムが発生する可能性
+
+→ **鉄は熱いうちに打て（最初の設計が肝心）**
+
+---
+
+### 判断フロー
+
+```
+毎回結合+集約が必要なクエリ？
+├─ YES → 頻繁に実行される？
+│        ├─ YES → 集計列追加を検討
+│        └─ NO  → そのままでも許容
+│
+└─ NO  → そのまま
+
+集計列を追加する場合:
+  更新頻度は？
+    ├─ 低い（日次バッチ等） → 集計列追加が有効
+    └─ 高い（リアルタイム） → トレードオフを慎重に検討
+
+  リアルタイム性は必要？
+    ├─ YES → ビューまたはキャッシュを検討
+    └─ NO  → 集計列追加が有効
+```
+
+---
+
+### 代替案: マテリアライズドビュー
+
+集計列を追加する代わりに、**マテリアライズドビュー（実体化ビュー）** を使う方法もある。
+
+```sql
+-- MySQL 8.0+ の場合（近似）
+CREATE TABLE OrderSummary AS
+SELECT order_id, order_name, COUNT(*) AS item_count
+FROM Orders O
+JOIN OrderReceipts ORC ON O.order_id = ORC.order_id
+GROUP BY O.order_id, O.order_name;
+
+-- 定期的にリフレッシュ
+TRUNCATE TABLE OrderSummary;
+INSERT INTO OrderSummary
+SELECT order_id, order_name, COUNT(*) AS item_count
+FROM Orders O
+JOIN OrderReceipts ORC ON O.order_id = ORC.order_id
+GROUP BY O.order_id, O.order_name;
+```
+
+**メリット:**
+- 元のテーブル構造を変更しない
+- リフレッシュタイミングを制御できる
+
+**デメリット:**
+- 別テーブルの管理が必要
+- リフレッシュ中のデータ不整合
+
+---
+
+### 名言
+
+> 「賢いデータ構造と間抜けなコードのほうが、その逆よりずっとまし」
+>
+> 「フローチャートだけ見せてテーブルを見せないなら煙に巻かれたまま」
+
+---
+
+### 教訓
+
+**1. データモデルがコードを決める（その逆ではない）**
+- テーブル設計が良ければ、SQLはシンプルになる
+- テーブル設計が悪ければ、どんなにSQLを工夫しても限界がある
+
+**2. 間違ったモデルはコーディングで正せない**
+- モデルの問題はモデルで解決する
+- コードで無理やり解決しようとしない
+
+**3. スーパーソルジャーより正しい戦略を選ぶ将官になれ**
+- 難しい問題を難しいまま解かない
+- 一歩引いて「そもそもテーブル設計おかしくない？」と考える
+- 最初の設計段階でモデリングを見直す
+
+---
+
+### 検出方法
+
+#### 1. クエリの複雑さ
+
+```
+複雑な結合+集約が毎回必要？
+  ├─ YES → モデルを見直す
+  └─ NO  → OK
+```
+
+#### 2. パフォーマンス問題
+
+```
+特定のクエリが常に遅い？
+  ├─ YES → インデックス追加で解決する？
+  │        ├─ NO  → モデルを見直す
+  │        └─ YES → インデックス追加
+  │
+  └─ NO  → OK
+```
+
+#### 3. 実行頻度
+
+```
+同じパターンの集計クエリを頻繁に実行している？
+  ├─ YES → 集計列追加を検討
+  └─ NO  → そのまま
+```
+
+---
+
+### まとめ
+
+**スーパーソルジャー病の症状:**
+❌ 難しい問題を難しいまま解こうとする
+❌ SQLで何とかしようとして複雑なクエリを書く
+❌ データモデルの問題をコードで解決しようとする
+
+**処方箋:**
+✅ 一歩引いて「そもそもテーブル設計おかしくない？」と考える
+✅ コーディングの前にモデリングを見直す
+✅ 鉄は熱いうちに打て（最初の設計が肝心）
+
+**モデル変更の判断:**
+- メリット: SQLシンプル、パフォーマンス向上、実行計画安定
+- デメリット: 更新コスト増加、タイムラグ発生、後からの変更は大変
+- トレードオフを慎重に検討する
+
+**参照:**
+- [tasks/review-query.md](../tasks/review-query.md#10-データモデルスーパーソルジャー病) - データモデルチェックリスト
