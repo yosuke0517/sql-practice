@@ -20,8 +20,7 @@
 .claude/skills/sql-performance-optimization/
 ├── knowledge/     - 性能問題のパターンと解決策（詳細ドキュメント）
 ├── tasks/         - タスク別ガイド（レビュー手順、診断手順等）
-├── examples/      - 改善前後の具体例
-└── reference/     - リファレンス情報（DBMS固有情報、キーワード等）
+└── examples/      - 改善前後の具体例
 ```
 
 ---
@@ -44,10 +43,10 @@
 | ファイル | 内容 |
 |---------|------|
 | [review-query.md](tasks/review-query.md) | SQLクエリレビューチェックリスト（11項目：CASE式、集約、ループ、結合、サブクエリ、順序、更新、TEMP落ち、複雑度、データモデル、インデックス） |
-| diagnose-slow-query.md | 遅いクエリの診断手順（TODO） |
-| read-execution-plan.md | 実行計画の読み方（TODO） |
-| design-index.md | インデックス設計ガイド（TODO） |
-| compare-queries.md | クエリ比較手順（TODO） |
+| [diagnose-slow-query.md](tasks/diagnose-slow-query.md) | 遅いクエリの診断手順（症状確認、実行計画取得、ボトルネック特定、原因分類、改善策提示） |
+| [read-execution-plan.md](tasks/read-execution-plan.md) | 実行計画の読み方（type/Extra/FORMAT=TREE解説、危険サイン判別、改善指針） |
+| [design-index.md](tasks/design-index.md) | インデックス設計ガイド（手順、複合インデックス順序、カーディナリティ確認） |
+| [compare-queries.md](tasks/compare-queries.md) | クエリ比較手順（実行計画・行数・インデックス・ソート・可読性の5観点） |
 
 ---
 
