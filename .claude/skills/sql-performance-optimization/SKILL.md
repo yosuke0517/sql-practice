@@ -160,6 +160,21 @@ SELECT * FROM Orders WHERE customer_id = ? AND order_date >= ?;
 
 ---
 
+## 関連スキル
+
+クエリ性能の問題は、DB設計に起因することがあります。以下のケースでは `database-design-patterns` スキルも参照してください。
+
+| 性能問題 | 設計上の原因 | 参照先 |
+|---------|-------------|--------|
+| LIKE '%x%' が遅い | Jaywalking（カンマ区切り格納） | database-design-patterns/knowledge/logical-design-antipatterns.md |
+| JOINが多すぎる | EAV（汎用属性テーブル） | database-design-patterns/knowledge/logical-design-antipatterns.md |
+| 再帰クエリが遅い | Naive Trees（parent_idのみ） | database-design-patterns/knowledge/logical-design-antipatterns.md |
+| UNIONだらけ | Metadata Tribbles（テーブル分割） | database-design-patterns/knowledge/logical-design-antipatterns.md |
+
+DB設計のレビューは `/db-review` コマンドを使用してください。
+
+---
+
 ## 構成情報
 
 - **書籍ベース:** `sql-performance-optimization.pdf`

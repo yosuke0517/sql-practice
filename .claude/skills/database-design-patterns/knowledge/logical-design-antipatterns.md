@@ -669,6 +669,67 @@ WHERE cp.ancestor_id = 1;
 - 行数が多い（N個のノード → O(N²) 行）
 - INSERT/DELETE が複雑
 
+**ノード追加時のINSERTパターン:**
+```sql
+-- 新しいカテゴリ「Gaming Laptops」(id=6) を「Laptops」(id=3) の子として追加
+
+-- 1. カテゴリ本体を挿入
+INSERT INTO Categories VALUES (6, 'Gaming Laptops');
+
+-- 2. 閉包テーブルに関係を挿入
+-- 自分自身への参照
+INSERT INTO CategoryPaths (ancestor_id, descendant_id, depth)
+VALUES (6, 6, 0);
+
+-- 親の先祖すべてからの参照を追加（depth + 1）
+INSERT INTO CategoryPaths (ancestor_id, descendant_id, depth)
+SELECT ancestor_id, 6, depth + 1
+FROM CategoryPaths
+WHERE descendant_id = 3;  -- 親のID
+
+-- 結果: (1,6,3), (2,6,2), (3,6,1), (6,6,0) が追加される
+```
+
+**ノード削除時のDELETEパターン:**
+```sql
+-- カテゴリ「Laptops」(id=3) とその子孫を削除
+
+-- 1. 閉包テーブルから削除（子孫への参照をすべて削除）
+DELETE FROM CategoryPaths
+WHERE descendant_id IN (
+    SELECT descendant_id
+    FROM CategoryPaths
+    WHERE ancestor_id = 3
+);
+
+-- 2. カテゴリ本体を削除
+DELETE FROM Categories
+WHERE category_id IN (3, 6);  -- Laptops と Gaming Laptops
+```
+
+**サブツリー移動のパターン:**
+```sql
+-- 「Computers」(id=2) を「Smartphones」(id=5) の子に移動
+
+-- 1. 古い先祖との関係を削除（自分自身以外）
+DELETE FROM CategoryPaths
+WHERE descendant_id IN (
+    SELECT descendant_id FROM CategoryPaths WHERE ancestor_id = 2
+)
+AND ancestor_id IN (
+    SELECT ancestor_id FROM CategoryPaths WHERE descendant_id = 2 AND ancestor_id != descendant_id
+);
+
+-- 2. 新しい先祖との関係を追加
+INSERT INTO CategoryPaths (ancestor_id, descendant_id, depth)
+SELECT supertree.ancestor_id, subtree.descendant_id,
+       supertree.depth + subtree.depth + 1
+FROM CategoryPaths AS supertree
+CROSS JOIN CategoryPaths AS subtree
+WHERE supertree.descendant_id = 5  -- 新しい親
+  AND subtree.ancestor_id = 2;     -- 移動するノード
+```
+
 ### 検出方法
 
 #### チェックポイント

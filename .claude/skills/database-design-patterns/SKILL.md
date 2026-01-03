@@ -113,6 +113,20 @@ CREATE TABLE Orders (
 
 ---
 
+## 関連スキル
+
+DB設計の問題はクエリ性能にも影響します。以下のケースでは `sql-performance-optimization` スキルも参照してください。
+
+| DB設計の問題 | 性能への影響 | 参照先 |
+|-------------|-------------|--------|
+| Jaywalking（カンマ区切り） | LIKE '%x%' でインデックス無効 | sql-performance-optimization/knowledge/index-strategies.md |
+| EAV（汎用属性テーブル） | JOIN爆発、サブクエリ複雑化 | sql-performance-optimization/knowledge/subquery-problems.md |
+| Naive Trees（parent_idのみ） | 再帰クエリのパフォーマンス | sql-performance-optimization/knowledge/anti-patterns.md |
+
+SQLクエリのレビューは `/sql-review` コマンドを使用してください。
+
+---
+
 ## 参考資料
 
 - O'Reilly「SQLアンチパターン」(oreilly-978-4-8144-0074-4e)
