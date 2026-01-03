@@ -131,6 +131,22 @@ SELECT * FROM Orders WHERE customer_id = ? AND order_date >= ?;
 
 ---
 
+## カスタムコマンドでの呼び出し
+
+```
+/sql-review SELECT * FROM ...
+```
+
+または
+
+```
+/sql-review path/to/query.sql
+```
+
+詳細は `.claude/commands/sql-review.md` を参照。
+
+---
+
 ## 核心メッセージ（書籍ベース）
 
 このスキルは以下の原則に基づいています：
